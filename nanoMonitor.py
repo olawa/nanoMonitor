@@ -28,6 +28,7 @@ import numpy as np
 from scipy.stats import gaussian_kde
 
 # Import modules
+sys.path.append(os.path.join(os.path.dirname(__file__), "python"))
 import ns_core
 import ns_workers
 import ns_plotting

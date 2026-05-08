@@ -818,8 +818,8 @@ class NanostreamWorker(QThread):
         if found: return found
         base = os.path.dirname(os.path.abspath(__file__))
         candidates = [
-            os.path.join(base, "nanostream", "target", "release", "nanostream"),
-            os.path.join(base, "target", "release", "nanostream"),
+            os.path.join(base, "..", "crates", "nanostream", "target", "release", "nanostream"),
+            os.path.join(base, "..", "target", "release", "nanostream"),
         ]
         for c in candidates:
             if os.path.exists(c): return c
@@ -832,8 +832,8 @@ class NanostreamWorker(QThread):
         if found: return found
         base = os.path.dirname(os.path.abspath(__file__))
         candidates = [
-            os.path.join(base, "nanoparse", "target", "release", "nanoparse"),
-            os.path.join(base, "target", "release", "nanoparse"),
+            os.path.join(base, "..", "crates", "nanoparse", "target", "release", "nanoparse"),
+            os.path.join(base, "..", "target", "release", "nanoparse"),
         ]
         for c in candidates:
             if os.path.exists(c): return c
