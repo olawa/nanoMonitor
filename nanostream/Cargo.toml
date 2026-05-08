@@ -12,3 +12,11 @@ env_logger = "0.11"
 nanofilter-core = { path = "../nanofilter-core" }
 nanoparse-core = { path = "../nanoparse-core" }
 nanoseq-core = { path = "../nanoseq-core" }
+
+[lib]
+name = "nanostream_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nanostream"
+path = "src/main.rs"

@@ -1,17 +1,17 @@
 use crate::model::FilterConfig;
 
 #[derive(Debug, Clone)]
-pub struct NanoparseConfig {
+pub struct NanostreamConfig {
     pub executable: String,
     pub primers_path: String,
     pub threads: usize,
     pub primer_tolerance: i64,
 }
 
-impl Default for NanoparseConfig {
+impl Default for NanostreamConfig {
     fn default() -> Self {
         Self {
-            executable: "nanoparse".into(),
+            executable: "nanostream".into(),
             primers_path: "primers.tsv".into(),
             threads: 8,
             primer_tolerance: 50,
@@ -43,7 +43,7 @@ impl CommandSpec {
     }
 }
 
-impl NanoparseConfig {
+impl NanostreamConfig {
     pub fn build_amplicon_command(
         &self,
         bam_path: &str,
@@ -53,8 +53,7 @@ impl NanoparseConfig {
     ) -> CommandSpec {
         let mut args = vec![
             "amplicons".into(),
-            "--bam".into(),
-            bam_path.into(),
+            bam_path.into(), // Positional in nanostream
             "--primers".into(),
             self.primers_path.clone(),
             "--threads".into(),

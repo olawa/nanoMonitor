@@ -509,8 +509,8 @@ class MainWindow(QMainWindow):
         self.chk_duplex = QCheckBox("Duplex Only")
         self.chk_duplex.stateChanged.connect(self.force_update_plots)
         
-        self.chk_use_rust = QCheckBox("Use Rust (nanoparse)")
-        self.chk_use_rust.setToolTip("Use fast Rust backend for primer matching (requires nanoparse binary)")
+        self.chk_use_rust = QCheckBox("Use Rust (nanostream)")
+        self.chk_use_rust.setToolTip("Use fast Rust backend for primer matching (requires nanostream binary)")
         self.chk_use_rust.setChecked(True)  # Default to Rust if available
         
         self.b_run_duplex = QPushButton("Run Duplex Discovery")
@@ -1330,7 +1330,7 @@ class MainWindow(QMainWindow):
                 self.mode == "Amplicon"
             )
             if use_rust:
-                self.worker_thread = ns_workers.NanoparseWorker(
+                self.worker_thread = ns_workers.NanostreamWorker(
                     self.current_bam_path, self.primer_file_path, threads=self.threads,
                     primer_tolerance=self.s_tolerance.value()
                 )
@@ -1461,12 +1461,12 @@ class MainWindow(QMainWindow):
                 secret=self.secret
             )
         else:
-            # Check if we should use nanoparse (Rust backend)
+            # Check if we should use nanostream (Rust backend)
             use_rust = self.chk_use_rust.isChecked() and self.primer_file_path and self.mode == "Amplicon"
             
             if use_rust:
-                self.log(f"Using nanoparse (Rust) for {os.path.basename(f)}...")
-                self.worker_thread = ns_workers.NanoparseWorker(
+                self.log(f"Using nanostream (Rust) for {os.path.basename(f)}...")
+                self.worker_thread = ns_workers.NanostreamWorker(
                     f, self.primer_file_path, threads=self.threads,
                     primer_tolerance=self.s_tolerance.value()
                 )
@@ -1750,7 +1750,7 @@ class MainWindow(QMainWindow):
                 new_candidates = {}
                 for name, data in amplicons_data.items():
                     region = data.get("region") if isinstance(data, dict) else None
-                    # Fallback for Nanoparse which provides raw coords
+                    # Fallback for Nanostream which provides raw coords
                     if not region and isinstance(data, dict):
                         c = data.get("chrom")
                         s = data.get("start")

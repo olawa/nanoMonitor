@@ -39,7 +39,7 @@ pub struct FilterConfig {
     pub min_len: u32,
     pub max_reads: u32,
     pub duplex_only: bool,
-    pub use_nanoparse: bool,
+    pub use_nanostream: bool,
 }
 
 impl Default for FilterConfig {
@@ -49,7 +49,7 @@ impl Default for FilterConfig {
             min_len: 300,
             max_reads: 0,
             duplex_only: false,
-            use_nanoparse: true,
+            use_nanostream: true,
         }
     }
 }

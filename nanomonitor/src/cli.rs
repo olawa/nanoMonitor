@@ -34,9 +34,9 @@ pub struct NanoMonitorCli {
     #[arg(long)]
     pub primers: Option<String>,
 
-    /// nanoparse executable path
-    #[arg(long = "nanoparse-bin")]
-    pub nanoparse_bin: Option<String>,
+    /// nanostream executable path
+    #[arg(long = "nanostream-bin")]
+    pub nanostream_bin: Option<String>,
 
     /// Start analysis immediately on launch
     #[arg(long)]

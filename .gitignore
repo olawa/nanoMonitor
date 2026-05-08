@@ -11,20 +11,43 @@ __pycache__/
 # Large biological data and generated outputs
 *.bam
 *.bai
+*.fastq
 *.fastq.gz
+*.fq
+*.fq.gz
+*.vcf
 *.vcf.gz
 *.vcf.gz.tbi
 *.pkl
 *.pdf
 *.png
 *.tmp
-*.vcf
+*.bed
+*.json
+!nanoparse-core/Cargo.toml
+!nanofilter-core/Cargo.toml
+
+# Specific generated files
+amplicons.json
+amplicons
 duplex_candidates_*.txt
 sam.tmp
+snapshot.png
+nanostream_report2.pdf
+
+# Reference data
+centromers.txt
+genome.txt
 
 # Backup and temp directories
 backup/
 tmp/
 
 # Rust specific
-Cargo.lock (optional, but usually kept for apps)
+Cargo.lock
+
+# Test and one-off scripts (keeping only core workers and monitor)
+test_*.py
+verify_*.py
+reproduce_*.py
+ns_rust.rs

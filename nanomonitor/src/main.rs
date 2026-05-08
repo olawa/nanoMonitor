@@ -1,7 +1,7 @@
 mod app;
 mod cli;
 mod model;
-mod nanoparse_cli;
+mod nanostream_cli;
 mod remote;
 
 use app::{AppStartupConfig, NanoMonitorApp};
@@ -22,7 +22,7 @@ fn main() -> Result<(), eframe::Error> {
         reference_path: args.reference,
         gtf_path: args.gtf,
         primers_path: args.primers,
-        nanoparse_bin: args.nanoparse_bin,
+        nanostream_bin: args.nanostream_bin,
         run_on_start: args.start,
     };
 

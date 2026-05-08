@@ -787,7 +787,7 @@ class RsnapVariantWorker(QThread):
         except Exception as e:
             self.finished.emit(False, f"Error running rsnap: {e}", [])
 
-class NanoparseWorker(QThread):
+class NanostreamWorker(QThread):
     """
     Worker that calls nanoparse Rust CLI for fast primer matching.
     """
@@ -806,52 +806,73 @@ class NanoparseWorker(QThread):
         self.max_edit_dist = max_edit_dist
         self.primer_tolerance = primer_tolerance
         
-        # Find nanoparse binary
-        self.nanoparse_bin = self._find_nanoparse()
+        # Find unified binary
+        self.nanostream_bin = self._find_nanostream()
+        # Fallback for legacy
+        self.nanostream_bin = self._find_nanoparse() if not self.nanostream_bin else None
         
+    def _find_nanostream(self):
+        """Locate nanostream binary."""
+        import shutil
+        found = shutil.which("nanostream")
+        if found: return found
+        base = os.path.dirname(os.path.abspath(__file__))
+        candidates = [
+            os.path.join(base, "nanostream", "target", "release", "nanostream"),
+            os.path.join(base, "target", "release", "nanostream"),
+        ]
+        for c in candidates:
+            if os.path.exists(c): return c
+        return None
+
     def _find_nanoparse(self):
         """Locate nanoparse binary."""
         import shutil
-        
-        # Check in PATH first
         found = shutil.which("nanoparse")
-        if found:
-            return found
-            
-        # Check relative to this file
+        if found: return found
         base = os.path.dirname(os.path.abspath(__file__))
         candidates = [
             os.path.join(base, "nanoparse", "target", "release", "nanoparse"),
-            os.path.join(base, "..", "backend_rust", "nanoparse", "target", "release", "nanoparse"),
             os.path.join(base, "target", "release", "nanoparse"),
         ]
         for c in candidates:
-            if os.path.exists(c):
-                return c
-                
+            if os.path.exists(c): return c
         return None
         
     def run(self):
         import subprocess
         import json
         
-        if not self.nanoparse_bin:
-            self.error.emit("nanoparse binary not found. Please build it first.")
+        if not self.nanostream_bin and not self.nanostream_bin:
+            self.error.emit("nanostream or nanoparse binary not found. Please build it first.")
             self.finished_file.emit(self.bam_file)
             return
             
         try:
-            cmd = [
-                self.nanoparse_bin,
-                "amplicons",
-                "-b", self.bam_file,
-                "-p", self.primers_path,
-                "-t", str(self.threads),
-                "--end-length", str(self.end_length),
-                "--max-edit-dist", str(self.max_edit_dist),
-                "--primer-tolerance", str(self.primer_tolerance),
-                "-o", "-"  # Output to stdout
-            ]
+            if self.nanostream_bin:
+                cmd = [
+                    self.nanostream_bin,
+                    "amplicons",
+                    self.bam_file,
+                    "-p", self.primers_path,
+                    "-t", str(self.threads),
+                    "--end-length", str(self.end_length),
+                    "--max-edit-dist", str(self.max_edit_dist),
+                    "--primer-tolerance", str(self.primer_tolerance),
+                    "-o", "-"
+                ]
+            else:
+                cmd = [
+                    self.nanostream_bin,
+                    "amplicons",
+                    "-b", self.bam_file,
+                    "-p", self.primers_path,
+                    "-t", str(self.threads),
+                    "--end-length", str(self.end_length),
+                    "--max-edit-dist", str(self.max_edit_dist),
+                    "--primer-tolerance", str(self.primer_tolerance),
+                    "-o", "-"
+                ]
             
             self.progress.emit(0)
             
@@ -903,7 +924,7 @@ class NanoparseWorker(QThread):
             self.error.emit(f"Failed to parse nanoparse output: {e}")
             self.finished_file.emit(self.bam_file)
         except Exception as e:
-            self.error.emit(f"NanoparseWorker error: {e}")
+            self.error.emit(f"NanostreamWorker error: {e}")
             self.finished_file.emit(self.bam_file)
 class BatchRsnapWorker(QThread):
     """

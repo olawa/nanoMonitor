@@ -2,7 +2,7 @@ use crate::model::{
     AnalysisMode, DashboardData, FilterConfig, HistogramBin, MainTab, ResultRow, RunConfig,
     RunSource,
 };
-use crate::nanoparse_cli::NanoparseConfig;
+use crate::nanostream_cli::NanostreamConfig;
 use crate::remote::{MonitorEvent, MonitorRequest, RemoteConfig, RemoteStatus};
 use eframe::egui::{self, Align, Color32, Layout, RichText, Stroke, Vec2};
 use egui_plot::{Bar, BarChart, Line, Plot, PlotPoints, Points};
@@ -48,7 +48,7 @@ pub struct AppStartupConfig {
     pub reference_path: Option<String>,
     pub gtf_path: Option<String>,
     pub primers_path: Option<String>,
-    pub nanoparse_bin: Option<String>,
+    pub nanostream_bin: Option<String>,
     pub run_on_start: bool,
 }
 
@@ -58,7 +58,7 @@ pub struct NanoMonitorApp {
     filters: FilterConfig,
     run: RunConfig,
     remote: RemoteConfig,
-    nanoparse: NanoparseConfig,
+    pub nanostream: NanostreamConfig,
     reference_path: String,
     gtf_path: String,
     data: DashboardData,
@@ -167,19 +167,19 @@ impl NanoMonitorApp {
 
     fn validate_run_prerequisites(&mut self) -> Result<(), String> {
         if self.mode != AnalysisMode::Amplicon {
-            return Err("Only Amplicon mode is wired to nanoparse for now".into());
+            return Err("Only Amplicon mode is wired to nanostream for now".into());
         }
-        if !self.filters.use_nanoparse {
-            return Err("Enable 'Use Rust (nanoparse)' to run analysis".into());
+        if !self.filters.use_nanostream {
+            return Err("Enable 'Use Rust (nanostream)' to run analysis".into());
         }
-        if self.nanoparse.primers_path.trim().is_empty() {
+        if self.nanostream.primers_path.trim().is_empty() {
             return Err("Primers path is required".into());
         }
-        let primer_path = PathBuf::from(self.nanoparse.primers_path.trim());
+        let primer_path = PathBuf::from(self.nanostream.primers_path.trim());
         if !primer_path.exists() {
             return Err(format!(
                 "Primers path does not exist: {}",
-                self.nanoparse.primers_path
+                self.nanostream.primers_path
             ));
         }
         if !self.reference_path.trim().is_empty() {
@@ -218,10 +218,10 @@ impl NanoMonitorApp {
         None
     }
 
-    fn resolve_nanoparse_executable(&self) -> Result<String, String> {
-        let configured = self.nanoparse.executable.trim();
+    fn resolve_nanostream_executable(&self) -> Result<String, String> {
+        let configured = self.nanostream.executable.trim();
         if configured.is_empty() {
-            return Err("nanoparse binary path is empty".into());
+            return Err("nanostream binary path is empty".into());
         }
 
         let configured_path = PathBuf::from(configured);
@@ -229,7 +229,7 @@ impl NanoMonitorApp {
             if configured_path.is_file() {
                 return Ok(configured_path.to_string_lossy().to_string());
             }
-            return Err(format!("nanoparse binary not found: {}", configured));
+            return Err(format!("nanostream binary not found: {}", configured));
         }
 
         if let Some(found) = Self::find_in_path(configured) {
@@ -239,11 +239,11 @@ impl NanoMonitorApp {
         let exe_name = {
             #[cfg(windows)]
             {
-                "nanoparse.exe"
+                "nanostream.exe"
             }
             #[cfg(not(windows))]
             {
-                "nanoparse"
+                "nanostream"
             }
         };
 
@@ -253,13 +253,13 @@ impl NanoMonitorApp {
             candidates.push(cwd.join("target").join("debug").join(exe_name));
             candidates.push(cwd.join("target").join("release").join(exe_name));
             candidates.push(
-                cwd.join("nanoparse")
+                cwd.join("nanostream")
                     .join("target")
                     .join("debug")
                     .join(exe_name),
             );
             candidates.push(
-                cwd.join("nanoparse")
+                cwd.join("nanostream")
                     .join("target")
                     .join("release")
                     .join(exe_name),
@@ -283,7 +283,7 @@ impl NanoMonitorApp {
         }
 
         Err(format!(
-            "Could not locate 'nanoparse'. Set nanoparse binary explicitly or build it (`cargo build -p nanoparse`)."
+            "Could not locate 'nanostream'. Set nanostream binary explicitly or build it (`cargo build -p nanostream`)."
         ))
     }
 
@@ -361,7 +361,7 @@ impl NanoMonitorApp {
         self.monitor_active = false;
     }
 
-    fn nanoparse_supports_file(path: &str) -> bool {
+    fn nanostream_supports_file(path: &str) -> bool {
         let s = path.to_ascii_lowercase();
         s.ends_with(".bam")
             || s.ends_with(".fastq")
@@ -371,9 +371,9 @@ impl NanoMonitorApp {
     }
 
     fn start_analysis_for_file(&mut self, input_path: String) {
-        if !Self::nanoparse_supports_file(&input_path) {
+        if !Self::nanostream_supports_file(&input_path) {
             let msg = format!(
-                "Skipping unsupported input for nanoparse (expected BAM/FASTQ): {}",
+                "Skipping unsupported input for nanostream (expected BAM/FASTQ): {}",
                 input_path
             );
             self.last_error = Some(msg.clone());
@@ -384,7 +384,7 @@ impl NanoMonitorApp {
 
         let (tx, rx) = mpsc::channel::<WorkerMessage>();
         let command_line = self
-            .nanoparse
+            .nanostream
             .build_amplicon_command(
                 &input_path,
                 &self.filters,
@@ -399,9 +399,9 @@ impl NanoMonitorApp {
         self.worker_rx = Some(rx);
         self.run_state = RunState::Running;
         self.current_input = Some(input_path.clone());
-        let primers_path = self.nanoparse.primers_path.clone();
-        let threads = self.nanoparse.threads;
-        let primer_tolerance = self.nanoparse.primer_tolerance;
+        let primers_path = self.nanostream.primers_path.clone();
+        let threads = self.nanostream.threads;
+        let primer_tolerance = self.nanostream.primer_tolerance;
         let min_qs = self.filters.min_qs;
         let min_len = self.filters.min_len as usize;
         let max_reads = self.filters.max_reads as usize;
@@ -428,8 +428,8 @@ impl NanoMonitorApp {
                 reference.as_deref(),
                 gtf.as_deref(),
             ) {
-                Ok(parsed) => Ok(build_dashboard_from_nanoparse(parsed)),
-                Err(e) => Err(format!("nanoparse core failed: {}", e)),
+                Ok(parsed) => Ok(build_dashboard_from_nanostream(parsed)),
+                Err(e) => Err(format!("nanostream core failed: {}", e)),
             };
 
             let _ = tx.send(WorkerMessage::Completed { input_path, result });
@@ -458,7 +458,7 @@ impl NanoMonitorApp {
             .add_filter("TSV/TXT", &["tsv", "txt"])
             .pick_file()
         {
-            self.nanoparse.primers_path = path.to_string_lossy().to_string();
+            self.nanostream.primers_path = path.to_string_lossy().to_string();
         }
     }
 
@@ -557,7 +557,7 @@ impl NanoMonitorApp {
                     )
                     .map(|_| format!("Wrote filtered FASTQ to {}", output))
                 }
-            } else if Self::nanoparse_supports_file(&input) {
+            } else if Self::nanostream_supports_file(&input) {
                 filter_fastq::filter_fastq_with_settings(
                     Path::new(&input),
                     Path::new(&output),
@@ -622,7 +622,7 @@ impl NanoMonitorApp {
                     false,
                 )
                 .map(|_| format!("Barcode split complete in {}", output_dir))
-            } else if Self::nanoparse_supports_file(&input) {
+            } else if Self::nanostream_supports_file(&input) {
                 filter_fastq::split_fastq_by_barcodes(
                     Path::new(&input),
                     Path::new(&barcode_file),
@@ -689,14 +689,14 @@ impl NanoMonitorApp {
             filters: FilterConfig::default(),
             run: RunConfig::default(),
             remote: RemoteConfig::default(),
-            nanoparse: NanoparseConfig::default(),
+            nanostream: NanostreamConfig::default(),
             reference_path: String::new(),
             gtf_path: String::new(),
             data: DashboardData::empty(),
             log_lines: vec![
                 "nanoMonitor initialized".into(),
                 "Ready for local and remote analysis".into(),
-                "Press Start Monitor to run nanoparse and refresh distributions".into(),
+                "Press Start Monitor to run nanostream and refresh distributions".into(),
             ],
             run_state: RunState::Idle,
             worker_rx: None,
@@ -718,11 +718,11 @@ impl NanoMonitorApp {
             barcode_output_dir: String::new(),
         };
 
-        if let Some(bin) = startup.nanoparse_bin {
-            app.nanoparse.executable = bin;
+        if let Some(bin) = startup.nanostream_bin {
+            app.nanostream.executable = bin;
         }
         if let Some(primers) = startup.primers_path {
-            app.nanoparse.primers_path = primers;
+            app.nanostream.primers_path = primers;
         }
         if let Some(reference) = startup.reference_path {
             app.reference_path = reference;
@@ -974,12 +974,12 @@ impl NanoMonitorApp {
                 self.pick_reference_file();
             }
             ui.horizontal(|ui| {
-                ui.label("nanoparse binary:");
-                ui.text_edit_singleline(&mut self.nanoparse.executable);
+                ui.label("nanostream binary:");
+                ui.text_edit_singleline(&mut self.nanostream.executable);
             });
             ui.horizontal(|ui| {
                 ui.label("primers file:");
-                ui.text_edit_singleline(&mut self.nanoparse.primers_path);
+                ui.text_edit_singleline(&mut self.nanostream.primers_path);
                 if ui.button("...").clicked() {
                     self.pick_primers_file();
                 }
@@ -1159,7 +1159,7 @@ impl NanoMonitorApp {
                 ui.add(egui::DragValue::new(&mut self.filters.max_reads).speed(100.0).prefix("Max Reads "));
                 ui.label(RichText::new("(0 = all reads)").small());
                 ui.checkbox(&mut self.filters.duplex_only, "Duplex only");
-                ui.checkbox(&mut self.filters.use_nanoparse, "Use Rust (nanoparse)");
+                ui.checkbox(&mut self.filters.use_nanostream, "Use Rust (nanostream)");
                 if ui.button("Recalculate").clicked() {
                     self.log_lines
                         .push("Recalculate requested with current filters".into());
@@ -1185,16 +1185,16 @@ impl NanoMonitorApp {
             ui.selectable_value(&mut self.tab, MainTab::Results, "Results");
             ui.selectable_value(&mut self.tab, MainTab::Log, "Log");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("Build nanoparse command").clicked() {
+                if ui.button("Build nanostream command").clicked() {
                     match self.resolve_run_input_path() {
                         Ok(path) => {
-                            let mut cmd = self.nanoparse.build_amplicon_command(
+                            let mut cmd = self.nanostream.build_amplicon_command(
                                 &path,
                                 &self.filters,
                                 Some(self.reference_path.as_str()),
                                 Some(self.gtf_path.as_str()),
                             );
-                            match self.resolve_nanoparse_executable() {
+                            match self.resolve_nanostream_executable() {
                                 Ok(bin) => {
                                     cmd.program = bin;
                                     self.log_lines.push(format!("CLI> {}", cmd.as_shell_line()));
@@ -1476,7 +1476,7 @@ impl Drop for NanoMonitorApp {
     }
 }
 
-fn build_dashboard_from_nanoparse(output: AmpliconResult) -> DashboardData {
+fn build_dashboard_from_nanostream(output: AmpliconResult) -> DashboardData {
     let mut rows = output
         .amplicons
         .into_iter()

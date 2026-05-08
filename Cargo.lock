@@ -2160,8 +2160,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "env_logger",
+ "log",
  "nanofilter-core",
  "nanoseq-core",
+ "nanostream",
 ]
 
 [[package]]
@@ -2205,6 +2208,7 @@ dependencies = [
  "clap",
  "env_logger",
  "nanoparse-core",
+ "nanostream",
 ]
 
 [[package]]
