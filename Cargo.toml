@@ -1,0 +1,3 @@
+[workspace]
+members = ["nanomonitor","nanoparse","nanoparse-core","nanoseq-core","nanofilter-core","nanofilter","nanostream"]
+resolver = "2"

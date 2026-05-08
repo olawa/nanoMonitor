@@ -1,0 +1,10 @@
+[package]
+name = "nanofilter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+nanofilter-core = { path = "../nanofilter-core" }
+nanoseq-core = { path = "../nanoseq-core" }

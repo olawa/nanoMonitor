@@ -1,0 +1,14 @@
+[package]
+name = "nanostream"
+version = "0.1.0"
+edition = "2021"
+authors = ["nanoStream Team"]
+description = "Unified Rust CLI for nanopore parsing, filtering, and monitoring workflows"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+nanofilter-core = { path = "../nanofilter-core" }
+nanoparse-core = { path = "../nanoparse-core" }
+nanoseq-core = { path = "../nanoseq-core" }

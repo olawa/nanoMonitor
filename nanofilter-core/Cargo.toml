@@ -1,0 +1,19 @@
+[package]
+name = "nanofilter-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+crossbeam-channel = "0.5"
+flate2 = "1.0"
+needletail = "0.5.1"
+noodles = { version = "0.84", features = ["bam", "sam", "bgzf"] }
+noodles-bgzf = "0.33"
+rayon = "1.10"
+nanoseq-core = { path = "../nanoseq-core" }
+
+[dev-dependencies]
+tempfile = "3"

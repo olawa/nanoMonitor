@@ -1,0 +1,30 @@
+# Build artifacts
+target/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS files
+.DS_Store
+
+# Large biological data and generated outputs
+*.bam
+*.bai
+*.fastq.gz
+*.vcf.gz
+*.vcf.gz.tbi
+*.pkl
+*.pdf
+*.png
+*.tmp
+*.vcf
+duplex_candidates_*.txt
+sam.tmp
+
+# Backup and temp directories
+backup/
+tmp/
+
+# Rust specific
+Cargo.lock (optional, but usually kept for apps)
