@@ -860,7 +860,7 @@ where
 
         let mut writers: HashMap<String, Box<dyn std::io::Write>> = HashMap::new();
 
-        let chunk_size = 500;
+        let chunk_size = 4096;
         let mut amplicons: HashMap<String, AmpliconStats> = HashMap::new();
         let mut primer_counts: HashMap<String, usize> = HashMap::new();
         let mut chimera_count = 0usize;
