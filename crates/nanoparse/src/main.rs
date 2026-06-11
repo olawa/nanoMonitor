@@ -60,7 +60,7 @@ enum Commands {
         #[arg(long, default_value = "0")]
         min_qs: f32,
         #[arg(long, default_value = "0")]
-        min_len: usize,
+        len: String,
         #[arg(long, default_value = "0")]
         max_reads: usize,
         #[arg(long, default_value_t = false)]
@@ -71,6 +71,12 @@ enum Commands {
         gtf: Option<String>,
         #[arg(long, default_value = "true")]
         summary: bool,
+        #[arg(long)]
+        output_fastq: Option<String>,
+        #[arg(long)]
+        output_dimers: Option<String>,
+        #[arg(long, default_value_t = false)]
+        split_by_amplicon: bool,
     },
     /// Calculate pore idle-time statistics
     PoreStats {
@@ -101,8 +107,40 @@ fn main() -> Result<()> {
         Commands::Enrichment { bam, bed, output, threads, cm_range } => {
             enrichment::run_enrichment(&bam, &bed, &output, threads, cm_range.as_deref())?;
         }
-        Commands::Amplicons { bam, primers, output, threads, mode, max_edit_dist, end_length, primer_tolerance, min_qs, min_len, max_reads, duplex_only, reference, gtf, summary } => {
-            matcher::run_amplicons_to_output(&bam, &primers, &output, threads, mode, max_edit_dist, end_length, summary, primer_tolerance, min_qs, min_len, max_reads, duplex_only, reference.as_deref(), gtf.as_deref())?;
+        Commands::Amplicons { bam, primers, output, threads, mode, max_edit_dist, end_length, primer_tolerance, min_qs, len, max_reads, duplex_only, reference, gtf, summary, output_fastq, output_dimers, split_by_amplicon } => {
+            let len_range = if len.is_empty() {
+                (0, usize::MAX)
+            } else {
+                let parts: Vec<&str> = len
+                    .split(|c| c == ',' || c == '-' || c == ' ')
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                match parts.as_slice() {
+                    [min] => (min.parse::<usize>()?, usize::MAX),
+                    [min, max] => (min.parse::<usize>()?, max.parse::<usize>()?),
+                    _ => anyhow::bail!("Invalid --len value"),
+                }
+            };
+            matcher::run_amplicons_to_output(
+                &bam,
+                &primers,
+                &output,
+                threads,
+                mode,
+                max_edit_dist,
+                end_length,
+                summary,
+                primer_tolerance,
+                min_qs,
+                len_range,
+                max_reads,
+                duplex_only,
+                reference.as_deref(),
+                gtf.as_deref(),
+                output_fastq.as_deref(),
+                output_dimers.as_deref(),
+                split_by_amplicon,
+            )?;
         }
         Commands::PoreStats { input, sequencing_summary, output, threads, max_idle_s, long_idle_s, speed_bps } => {
             pore_stats::run_pore_stats(input.as_deref(), sequencing_summary.as_deref(), output.as_deref(), threads, max_idle_s, long_idle_s, speed_bps)?;

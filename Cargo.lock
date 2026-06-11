@@ -2241,11 +2241,13 @@ name = "nanostream"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "env_logger",
  "nanofilter-core",
  "nanoparse-core",
  "nanoseq-core",
+ "tempfile",
 ]
 
 [[package]]

@@ -78,9 +78,9 @@ pub enum Commands {
         /// Minimum mean Q-score filter
         #[arg(long, default_value = "0")]
         min_qs: f32,
-        /// Minimum read length filter
+        /// Read length filter (e.g. 1000 or 1000-3000)
         #[arg(long, default_value = "0")]
-        min_len: usize,
+        len: String,
         /// Process at most this many reads (0 = no limit)
         #[arg(long, default_value = "0")]
         max_reads: usize,
@@ -96,6 +96,15 @@ pub enum Commands {
         /// Print summary stats to stderr
         #[arg(long, default_value = "true")]
         summary: bool,
+        /// Optional path to write valid matched FASTQ reads
+        #[arg(long)]
+        output_fastq: Option<String>,
+        /// Optional path to write primer dimers/invalid pairs
+        #[arg(long)]
+        output_dimers: Option<String>,
+        /// If set, split matched FASTQ reads by amplicon name
+        #[arg(long, default_value_t = false)]
+        split_by_amplicon: bool,
     },
     /// Calculate pore idle-time statistics
     PoreStats {
@@ -158,6 +167,9 @@ pub struct FilterArgs {
     /// Number of threads for threaded BAM IO and parallel FASTQ operations where supported
     #[arg(short, long, default_value_t = 8)]
     pub threads: usize,
+    /// Path to ONT sequencing summary file for relative time-filtering baseline discovery
+    #[arg(long)]
+    pub sequencing_summary: Option<PathBuf>,
 }
 
 #[derive(Parser, Clone)]

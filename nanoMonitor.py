@@ -354,7 +354,7 @@ class MainWindow(QMainWindow):
         mode_group = QGroupBox("Session")
         mode_layout = QHBoxLayout()
         self.combo_mode = QComboBox()
-        self.combo_mode.addItems(["Amplicon", "RNA-Seq"])
+        self.combo_mode.addItems(["Amplicon", "RNA-Seq", "DNA"])
         self.combo_mode.currentTextChanged.connect(self.change_mode)
         mode_layout.addWidget(QLabel("Mode:"))
         mode_layout.addWidget(self.combo_mode, 1)
@@ -415,19 +415,38 @@ class MainWindow(QMainWindow):
         l_rna.addWidget(QLabel("Optional"), 1, 1)
         l_rna.addWidget(self.b_load_gtf_rna, 1, 2)
 
+        p_dna = QWidget(); l_dna = QVBoxLayout(p_dna)
+        self.l_dna_info = QLabel("<b>Plain DNA Mode (QC Only):</b><br>Quality & length control for general sequencing runs.<br>No reference primers or gene BED/GTF files needed.")
+        self.l_dna_info.setWordWrap(True)
+        self.l_dna_info.setStyleSheet("color: #455a64; font-style: italic;")
+        l_dna.addWidget(self.l_dna_info)
+        l_dna.addStretch()
+
         self.stack.addWidget(p_amp)
         self.stack.addWidget(p_rna)
+        self.stack.addWidget(p_dna)
         monitor_layout.addWidget(self.stack)
 
-        browse_row = QHBoxLayout()
-        self.chk_monitor_dir = QCheckBox("Monitor directory")
+        # Input Selection Buttons Redesign
+        input_btn_layout = QHBoxLayout()
+        self.b_load_file = QPushButton("📂 Load File")
+        self.b_load_file.setStyleSheet("background-color: #BBDEFB; font-weight: bold; min-height: 28px; border-radius: 4px;")
+        self.b_load_file.clicked.connect(self.select_single_file)
+        
+        self.b_monitor_folder = QPushButton("👁️ Monitor Folder")
+        self.b_monitor_folder.setStyleSheet("background-color: #C8E6C9; font-weight: bold; min-height: 28px; border-radius: 4px;")
+        self.b_monitor_folder.clicked.connect(self.select_monitor_dir)
+        
+        input_btn_layout.addWidget(self.b_load_file)
+        input_btn_layout.addWidget(self.b_monitor_folder)
+        monitor_layout.addLayout(input_btn_layout)
+
+        # State Indicator Checkbox (Read-only/Disabled for clear status tracking)
+        self.chk_monitor_dir = QCheckBox("Directory Monitoring Active")
+        self.chk_monitor_dir.setEnabled(False)
+        self.chk_monitor_dir.setStyleSheet("color: #37474F; font-weight: bold;")
         self.chk_monitor_dir.toggled.connect(self.on_monitor_dir_toggled)
-        self.b_browse_input = QPushButton("Files")
-        self.b_browse_input.clicked.connect(self.select_input_source)
-        browse_row.addWidget(self.chk_monitor_dir)
-        browse_row.addStretch()
-        browse_row.addWidget(self.b_browse_input)
-        monitor_layout.addLayout(browse_row)
+        monitor_layout.addWidget(self.chk_monitor_dir)
 
         self.lbl_dir = QLabel("None")
         self.lbl_dir.setStyleSheet("color: #466;")
@@ -463,7 +482,9 @@ class MainWindow(QMainWindow):
         self.combo_barcode.addItem("All Barcodes")
         self.combo_barcode.currentTextChanged.connect(self.on_barcode_selected)
         self.combo_barcode.setStyleSheet("font-weight: 600; min-width: 100px;")
-        self.b_clear = QPushButton("Clear"); self.b_clear.clicked.connect(self.clear_session)
+        self.b_clear = QPushButton("Clear")
+        self.b_clear.setStyleSheet("background-color: #E0E0E0; font-weight: bold; min-height: 28px;")
+        self.b_clear.clicked.connect(self.on_clear_clicked)
         self.b_snap = QPushButton("Snap")
         self.b_snap.clicked.connect(self.open_snap_view)
         self.b_snap.setEnabled(False)
@@ -500,6 +521,12 @@ class MainWindow(QMainWindow):
         f_lay = QGridLayout()
         self.s_qs = QSpinBox(); self.s_qs.setValue(10); self.s_qs.setRange(0, 60)
         self.s_len = QSpinBox(); self.s_len.setRange(0, 50000)
+        self.s_max_len = QSpinBox()
+        self.s_max_len.setRange(0, 500000)
+        self.s_max_len.setValue(0)
+        self.s_max_len.setSpecialValueText("None")
+        self.s_max_len.setToolTip("Maximum read length limit (0 = none)")
+        
         self.s_filter_max_reads = QSpinBox()
         self.s_filter_max_reads.setRange(0, 1000000)
         self.s_filter_max_reads.setValue(0)
@@ -507,6 +534,7 @@ class MainWindow(QMainWindow):
         self.s_filter_max_reads.setToolTip("Limit selected/exported reads per amplicon (0 = all)")
         self.s_qs.valueChanged.connect(self.force_update_plots) 
         self.s_len.valueChanged.connect(self.force_update_plots)
+        self.s_max_len.valueChanged.connect(self.force_update_plots)
         self.chk_duplex = QCheckBox("Duplex Only")
         self.chk_duplex.stateChanged.connect(self.force_update_plots)
         
@@ -517,25 +545,27 @@ class MainWindow(QMainWindow):
         self.b_run_duplex = QPushButton("Run Duplex Discovery")
         self.b_run_duplex.setToolTip("Re-scan file with current filters to find duplex pairs")
         self.b_recalc = QPushButton("Recalculate Table")
-        self.b_recalc.setToolTip("Update table with current filters (QS, Len)")
+        self.b_recalc.setToolTip("Update table with current filters (QS, Len, Max Len)")
         self.b_recalc.clicked.connect(self.recalculate_table)
         
         self.b_auto_variant = QPushButton("Auto-Variant")
         self.b_auto_variant.setToolTip("Run variant calling for top amplicons")
         self.b_auto_variant.clicked.connect(self.run_batch_variant_calling)
-
+ 
         self.b_rsnap_var = QPushButton("rsnap Variant")
         self.b_rsnap_var.setToolTip("Run rsnap variant caller on selected amplicon")
         self.b_rsnap_var.clicked.connect(self.run_rsnap_variants)
         
         self.b_run_duplex.clicked.connect(self.run_duplex_discovery)
-
+ 
         f_lay.addWidget(QLabel("Min QS"), 0, 0)
         f_lay.addWidget(self.s_qs, 0, 1)
         f_lay.addWidget(QLabel("Min Len"), 0, 2)
         f_lay.addWidget(self.s_len, 0, 3)
-        f_lay.addWidget(QLabel("Max Reads"), 0, 4)
-        f_lay.addWidget(self.s_filter_max_reads, 0, 5)
+        f_lay.addWidget(QLabel("Max Len"), 0, 4)
+        f_lay.addWidget(self.s_max_len, 0, 5)
+        f_lay.addWidget(QLabel("Max Reads"), 0, 6)
+        f_lay.addWidget(self.s_filter_max_reads, 0, 7)
         f_lay.addWidget(self.chk_duplex, 1, 0, 1, 2)
         f_lay.addWidget(self.chk_use_rust, 1, 2, 1, 2)
         f_lay.addWidget(self.b_recalc, 1, 4, 1, 2)
@@ -615,11 +645,30 @@ class MainWindow(QMainWindow):
         self.web_hist = QWebEngineView()
         self.web_hist.setHtml(PLOTLY_HTML_TEMPLATE)
         
+        # Wrap histogram in a layout with bases/counts toggle
+        hist_container = QWidget()
+        hist_vlay = QVBoxLayout(hist_container)
+        hist_vlay.setContentsMargins(0, 0, 0, 0)
+        hist_vlay.setSpacing(2)
+        
+        hist_header = QHBoxLayout()
+        self.chk_hist_bases = QCheckBox("Show bases per bar")
+        self.chk_hist_bases.setToolTip("Toggle between read counts and total bases per length bin")
+        self.chk_hist_bases.stateChanged.connect(self.force_update_plots)
+        self.chk_hist_bases.setStyleSheet("font-weight: bold; color: #311B92;")
+        
+        hist_header.addWidget(QLabel("<b>Fragment Length Distribution</b>"))
+        hist_header.addStretch()
+        hist_header.addWidget(self.chk_hist_bases)
+        
+        hist_vlay.addLayout(hist_header)
+        hist_vlay.addWidget(self.web_hist)
+        
         # Top Row: Acc, QS, Hist (All Horizontal)
         plot_splitter = QSplitter(Qt.Orientation.Horizontal)
         plot_splitter.addWidget(self.web_acc)
         plot_splitter.addWidget(self.web_qs)
-        plot_splitter.addWidget(self.web_hist)
+        plot_splitter.addWidget(hist_container)
         
         # Sizes: Acc=0.75, QS=1, Hist=2 (Approx)
         plot_splitter.setSizes([225, 300, 675])
@@ -644,6 +693,8 @@ class MainWindow(QMainWindow):
 
     # --- PLOT UPDATES ---
     def update_plots_if_needed(self):
+        if hasattr(self, 'update_clear_button_state'):
+            self.update_clear_button_state()
         curr_len = len(self.read_qs)
         if curr_len > self.last_plot_data_len:
             self.update_plots()
@@ -680,10 +731,13 @@ class MainWindow(QMainWindow):
             
         min_qs = self.s_qs.value()
         min_len = self.s_len.value()
+        max_len = self.s_max_len.value()
         duplex_only = self.chk_duplex.isChecked()
         
         # Create filter mask
         mask = (qs_data >= min_qs) & (len_data >= min_len)
+        if max_len > 0:
+            mask = mask & (len_data <= max_len)
         if duplex_only:
             mask = mask & (dx_data == 1)
         
@@ -819,16 +873,60 @@ class MainWindow(QMainWindow):
             return
 
         visible = data[data < 50000]
+        if len(visible) == 0:
+            visible = data
         if len(visible) == 0: return
         median_len = np.median(visible)
         
-        trace = {
-            "x": data.tolist(), 
-            "type": "histogram", 
-            "xbins": {"start": 0, "end": 6000, "size": 100},  # Fixed bins: 0-6000 in 100bp increments
-            "marker": {"color": '#673AB7', "opacity": 0.75}, 
-            "name": 'Reads'
-        }
+        # Determine max length for histogram range and bins
+        filter_max_len = self.s_max_len.value() if hasattr(self, 's_max_len') else 0
+        if filter_max_len > 0:
+            max_len = filter_max_len
+        elif len(data) > 0:
+            max_len = int(np.max(data))
+        else:
+            max_len = 6000
+            
+        max_len = max(max_len, 1000)
+        
+        # Dynamic bin size: targeting around 60 bins
+        bin_size = max(10, int(max_len / 60))
+        # Round to clean intervals
+        if bin_size > 1000:
+            bin_size = (bin_size // 1000) * 1000
+        elif bin_size > 500:
+            bin_size = (bin_size // 500) * 500
+        elif bin_size > 100:
+            bin_size = (bin_size // 100) * 100
+        elif bin_size > 50:
+            bin_size = (bin_size // 50) * 50
+        elif bin_size > 10:
+            bin_size = (bin_size // 10) * 10
+        bin_size = max(bin_size, 10)
+        
+        # Check toggle state for Show Bases
+        show_bases = self.chk_hist_bases.isChecked() if hasattr(self, 'chk_hist_bases') else False
+        
+        if show_bases:
+            trace = {
+                "x": data.tolist(), 
+                "y": data.tolist(),
+                "histfunc": "sum",
+                "type": "histogram", 
+                "xbins": {"start": 0, "end": max_len, "size": bin_size},
+                "marker": {"color": '#673AB7', "opacity": 0.75}, 
+                "name": 'Bases'
+            }
+            yaxis_title = "Total Bases (bp)"
+        else:
+            trace = {
+                "x": data.tolist(), 
+                "type": "histogram", 
+                "xbins": {"start": 0, "end": max_len, "size": bin_size},
+                "marker": {"color": '#673AB7', "opacity": 0.75}, 
+                "name": 'Reads'
+            }
+            yaxis_title = "Count"
         
         shapes = [{"type": "line", "x0": median_len, "x1": median_len, "y0": 0, "y1": 1, "yref": "paper", "line": {"color": "orange", "width": 2, "dash": "dash"}}]
         annotations = [{"x": median_len, "y": 1, "yref": "paper", "text": f"Med: {int(median_len)}", "showarrow": False, "yshift": 10, "font": {"color": "orange"}}]
@@ -853,8 +951,8 @@ class MainWindow(QMainWindow):
 
         layout = {
             "margin": {"l": 50, "r": 20, "t": 30, "b": 40},
-            "xaxis": {"title": "Length (bp)", "range": [0, 6000]}, 
-            "yaxis": {"title": "Count"},
+            "xaxis": {"title": "Length (bp)", "range": [0, max_len]}, 
+            "yaxis": {"title": yaxis_title},
             "bargap": 0.1,
             "hovermode": "x",
             "shapes": shapes,
@@ -864,17 +962,6 @@ class MainWindow(QMainWindow):
         
         # Highlight selected amplicons
         if hasattr(self, 'selected_amplicons') and self.selected_amplicons:
-            # Get lengths for selected amplicons
-            # Filter global arrays
-            # Create mask for selected amplicons
-            # Note: self.read_amplicons is a list, convert to numpy for efficiency or use list comp
-            # For simplicity and speed, let's iterate or use numpy if possible.
-            # self.read_amplicons is parallel to self.read_len
-            
-            # Optimization: Convert read_amplicons to numpy array if not already (it is a list)
-            # This might be slow if list is huge.
-            # Alternative: Iterate and collect indices.
-            
             selected_indices = []
             for i, amp in enumerate(self.read_amplicons):
                 if amp in self.selected_amplicons:
@@ -886,7 +973,7 @@ class MainWindow(QMainWindow):
                 trace_selected = {
                     "x": selected_lengths.tolist(),
                     "type": "histogram",
-                    "xbins": {"start": 0, "end": 6000, "size": 100},
+                    "xbins": {"start": 0, "end": max_len, "size": bin_size},
                     "marker": {"color": 'red', "opacity": 0.6},
                     "name": 'Selected'
                 }
@@ -894,7 +981,6 @@ class MainWindow(QMainWindow):
         
         # Overlay concatemers as black bars
         if hasattr(self, 'read_concatemers') and any(self.read_concatemers):
-            # Get indices of concatemer reads
             concatemer_indices = [i for i, is_concat in enumerate(self.read_concatemers) if is_concat]
             
             if concatemer_indices:
@@ -903,17 +989,16 @@ class MainWindow(QMainWindow):
                 trace_concatemers = {
                     "x": concatemer_lengths.tolist(),
                     "type": "histogram",
-                    "xbins": {"start": 0, "end": 6000, "size": 100},
+                    "xbins": {"start": 0, "end": max_len, "size": bin_size},
                     "marker": {"color": 'black', "opacity": 0.7},
                     "name": 'Concatemers'
                 }
                 traces.append(trace_concatemers)
 
-
         layout = {
             "margin": {"l": 50, "r": 20, "t": 30, "b": 40},
-            "xaxis": {"title": "Length (bp)", "range": [0, 6000]}, 
-            "yaxis": {"title": "Count"},
+            "xaxis": {"title": "Length (bp)", "range": [0, max_len]}, 
+            "yaxis": {"title": yaxis_title},
             "bargap": 0.1,
             "hovermode": "x",
             "barmode": "overlay", # Overlay histograms
@@ -957,9 +1042,9 @@ class MainWindow(QMainWindow):
                 self.current_file_amplicons.extend(["Unknown"] * len(new_ids))
                 
             # Rolling Window (Memory Optimization)
-            # Check if we exceeded max_reads
+            # Check if we exceeded max_reads (only during live directory monitoring)
             current_total = len(self.read_qs)
-            if current_total > self.max_reads:
+            if self.is_monitoring and current_total > self.max_reads:
                 excess = current_total - self.max_reads
                 # Slice arrays to keep last N
                 self.read_qs = self.read_qs[excess:]
@@ -1310,6 +1395,7 @@ class MainWindow(QMainWindow):
         filters = {
             "min_qs": self.s_qs.value(),
             "min_len": 300,
+            "max_len": self.s_max_len.value(),
             "duplex_only": self.chk_duplex.isChecked(),
         }
 
@@ -1353,7 +1439,8 @@ class MainWindow(QMainWindow):
         self.worker_thread.error.connect(self.on_error)
         self.worker_thread.start()
     def change_mode(self, m):
-        self.mode = m; self.stack.setCurrentIndex(0 if m == "Amplicon" else 1)
+        self.mode = m
+        self.stack.setCurrentIndex(0 if m == "Amplicon" else 1 if m == "RNA-Seq" else 2)
         is_amplicon = (m == "Amplicon")
         self.chk_primer_analysis.setEnabled(is_amplicon)
         if not is_amplicon and self.chk_primer_analysis.isChecked():
@@ -1370,7 +1457,7 @@ class MainWindow(QMainWindow):
         ready = False
         has_source = bool(self.monitor_dir) if self.chk_monitor_dir.isChecked() else bool(self.current_bam_path)
         if has_source:
-            if self.mode == "Amplicon":
+            if self.mode in ["Amplicon", "DNA"]:
                 ready = True
             elif self.mode == "RNA-Seq":
                 ready = (self.gene_list is not None or self.gene_models is not None)
@@ -1448,7 +1535,7 @@ class MainWindow(QMainWindow):
             "genes": genes, 
             "qc_only": self.chk_qc_only.isChecked()
         }
-        filters = {"min_qs": 0, "min_len": 300, "duplex_only": self.chk_duplex.isChecked()} 
+        filters = {"min_qs": 0, "min_len": 300, "max_len": self.s_max_len.value(), "duplex_only": self.chk_duplex.isChecked()} 
         if self.server_address:
             from ns_workers import RemoteAnalysisWorker
             print(f"Starting Remote Analysis on {self.server_address}...")
@@ -1508,6 +1595,7 @@ class MainWindow(QMainWindow):
                 filters = {
                     "min_qs": self.s_qs.value(),
                     "min_len": 300, # Enforce 300bp min length for analysis
+                    "max_len": self.s_max_len.value(),
                     "duplex_only": self.chk_duplex.isChecked()
                 }
                 
@@ -1918,6 +2006,60 @@ class MainWindow(QMainWindow):
                     var_item.setToolTip(full_tooltip)
                 self.table.setItem(r, 5, var_item)
 
+        elif self.mode == "DNA":
+            self.update_table_headers()
+            
+            rows_to_show = []
+            min_qs = self.s_qs.value()
+            min_len = self.s_len.value()
+            max_len = self.s_max_len.value()
+            duplex_only = self.chk_duplex.isChecked()
+
+            def get_stats_for_arrays(qs_arr, len_arr, dx_arr):
+                if len(qs_arr) == 0:
+                    return 0, 0, 0.0, 0.0
+                mask = (qs_arr >= min_qs) & (len_arr >= min_len)
+                if max_len > 0:
+                    mask = mask & (len_arr <= max_len)
+                if duplex_only:
+                    mask = mask & (dx_arr == 1)
+                
+                f_qs = qs_arr[mask]
+                f_len = len_arr[mask]
+                count = len(f_len)
+                if count > 0:
+                    return count, int(np.median(f_len)), float(np.std(f_len)), float(np.mean(f_qs))
+                return 0, 0, 0.0, 0.0
+
+            if self.selected_file == "All Files":
+                # Whole Run Row
+                count, med, sd, avg_q = get_stats_for_arrays(self.read_qs, self.read_len, self.read_dx)
+                rows_to_show.append(("Whole Run", count, med, sd, avg_q))
+                
+                # Per File Rows
+                for filename, file_data in sorted(self.file_plot_data.items()):
+                    f_qs = file_data.get("qs", np.array([]))
+                    f_len = file_data.get("len", np.array([]))
+                    f_dx = file_data.get("dx", np.array([]))
+                    count, med, sd, avg_q = get_stats_for_arrays(f_qs, f_len, f_dx)
+                    rows_to_show.append((filename, count, med, sd, avg_q))
+            else:
+                # Selected File Row Only
+                file_data = self.file_plot_data.get(self.selected_file, {})
+                f_qs = file_data.get("qs", np.array([]))
+                f_len = file_data.get("len", np.array([]))
+                f_dx = file_data.get("dx", np.array([]))
+                count, med, sd, avg_q = get_stats_for_arrays(f_qs, f_len, f_dx)
+                rows_to_show.append((self.selected_file, count, med, sd, avg_q))
+
+            self.table.setRowCount(len(rows_to_show))
+            for r, (label, count, med, sd, avg_q) in enumerate(rows_to_show):
+                self.table.setItem(r, 0, QTableWidgetItem(str(label)))
+                self.table.setItem(r, 1, QTableWidgetItem(f"{count:,}"))
+                self.table.setItem(r, 2, QTableWidgetItem(f"{med}"))
+                self.table.setItem(r, 3, QTableWidgetItem(f"{sd:.1f}"))
+                self.table.setItem(r, 4, QTableWidgetItem(f"{avg_q:.1f}"))
+
         else:
             self.update_table_headers()
             sorted_items = sorted(self.global_stats.items(), key=lambda x: x[1], reverse=True)
@@ -1948,6 +2090,14 @@ class MainWindow(QMainWindow):
             self.table.setColumnCount(2)
             self.table.setHorizontalHeaderLabels(["Gene", "Reads"])
             self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        elif self.mode == "DNA":
+            self.table.setColumnCount(5)
+            self.table.setHorizontalHeaderLabels(["Sample / Barcode", "Count", "Med. Length", "SD Length", "Avg. QS"])
+            self.table.setColumnWidth(0, 300)
+            header = self.table.horizontalHeader()
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+            for i in range(1, 5):
+                header.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
 
     def update_selection_count(self):
         """Update the selection counter when table selection changes."""
@@ -2004,6 +2154,7 @@ class MainWindow(QMainWindow):
         # Get filter settings
         min_qs = self.s_qs.value()
         min_len = self.s_len.value()
+        max_len = self.s_max_len.value()
         duplex_only = self.chk_duplex.isChecked()
         
         # Show progress dialog
@@ -2022,7 +2173,8 @@ class MainWindow(QMainWindow):
             self.primer_dict,
             min_qs,
             min_len,
-            duplex_only
+            duplex_only,
+            max_len=max_len
         )
         self.export_worker.finished.connect(lambda count: self.on_export_finished(count, progress_dialog))
         self.export_worker.error.connect(lambda err: self.on_export_error(err, progress_dialog))
@@ -2088,6 +2240,11 @@ class MainWindow(QMainWindow):
                 ns_plotting.generate_pdf_report(stats, self.mode, total_reads, self)
     def recalculate_table(self):
         """Recalculate table stats based on current filters."""
+        if self.mode == "DNA":
+            self.log("Recalculating DNA statistics with current filters...")
+            self.refresh_table()
+            return
+            
         if len(self.read_amplicons) == 0: return
         
         self.log("Recalculating table with current filters...")
@@ -2095,6 +2252,7 @@ class MainWindow(QMainWindow):
         # 1. Get Mask
         min_qs = self.s_qs.value()
         min_len = self.s_len.value()
+        max_len = self.s_max_len.value()
         duplex_only = self.chk_duplex.isChecked()
         
         qs_data = self.read_qs
@@ -2105,6 +2263,8 @@ class MainWindow(QMainWindow):
         n = min(len(qs_data), len(len_data), len(self.read_amplicons))
         
         mask = (qs_data[:n] >= min_qs) & (len_data[:n] >= min_len)
+        if max_len > 0:
+            mask = mask & (len_data[:n] <= max_len)
         if duplex_only:
             mask = mask & (dx_data[:n] == 1)
             
@@ -2977,6 +3137,26 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Duplex Discovery", msg)
 
     def log(self, msg): self.log_view.append(msg)
+
+    def update_clear_button_state(self):
+        if self.is_processing or self.is_monitoring:
+            self.b_clear.setText("🛑 Stop")
+            self.b_clear.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; min-height: 28px;")
+        else:
+            self.b_clear.setText("Clear")
+            self.b_clear.setStyleSheet("background-color: #E0E0E0; font-weight: bold; min-height: 28px;")
+
+    def on_clear_clicked(self):
+        if self.is_processing or self.is_monitoring:
+            if self.is_monitoring:
+                self.stop_watcher()
+                self.is_monitoring = False
+            self.stop_processing()
+            self.l_status.setText("Stopped")
+            self.log("Analysis stopped by user.")
+            self.update_clear_button_state()
+        else:
+            self.clear_session()
 
 if __name__ == "__main__":
     import argparse

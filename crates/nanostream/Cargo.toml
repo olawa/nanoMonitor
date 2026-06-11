@@ -12,11 +12,17 @@ env_logger = "0.11"
 nanofilter-core = { path = "../nanofilter-core" }
 nanoparse-core = { path = "../nanoparse-core" }
 nanoseq-core = { path = "../nanoseq-core" }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
 
 [lib]
 name = "nanostream_lib"
 path = "src/lib.rs"
 
+[dev-dependencies]
+tempfile = "3"
+
 [[bin]]
 name = "nanostream"
 path = "src/main.rs"
+

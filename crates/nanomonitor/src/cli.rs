@@ -3,15 +3,13 @@ use clap::{Parser, ValueEnum};
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum CliMode {
     Amplicon,
-    RnaSeq,
-    Wgs,
 }
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "nanomonitor", version, about = "nanoMonitor GUI launcher")]
 pub struct NanoMonitorCli {
     /// Mode to initialize in
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, default_value = "amplicon")]
     pub mode: Option<CliMode>,
 
     /// Input data path (BAM/FASTQ file or directory)

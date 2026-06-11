@@ -6,3 +6,4 @@ pub mod fastq;
 pub mod filter;
 pub mod report;
 pub mod umi;
+pub mod time_bounds;

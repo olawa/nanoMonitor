@@ -36,13 +36,29 @@ fn main() -> Result<()> {
             end_length,
             primer_tolerance,
             min_qs,
-            min_len,
+            len,
             max_reads,
             duplex_only,
             reference,
             gtf,
             summary,
+            output_fastq,
+            output_dimers,
+            split_by_amplicon,
         } => {
+            let len_range = if len.is_empty() {
+                (0, usize::MAX)
+            } else {
+                let parts: Vec<&str> = len
+                    .split(|c| c == ',' || c == '-' || c == ' ')
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                match parts.as_slice() {
+                    [min] => (min.parse::<usize>()?, usize::MAX),
+                    [min, max] => (min.parse::<usize>()?, max.parse::<usize>()?),
+                    _ => anyhow::bail!("Invalid --len value"),
+                }
+            };
             matcher::run_amplicons_to_output(
                 &input,
                 &primers,
@@ -54,11 +70,14 @@ fn main() -> Result<()> {
                 summary,
                 primer_tolerance,
                 min_qs,
-                min_len,
+                len_range,
                 max_reads,
                 duplex_only,
                 reference.as_deref(),
                 gtf.as_deref(),
+                output_fastq.as_deref(),
+                output_dimers.as_deref(),
+                split_by_amplicon,
             )?;
         }
         cli::Commands::PoreStats {

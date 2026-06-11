@@ -644,7 +644,7 @@ fn get_channel_from_record(record: &bam::Record) -> Option<i64> {
     }
 }
 
-fn get_start_time_from_record(record: &bam::Record) -> Option<DateTime<FixedOffset>> {
+pub fn get_start_time_from_record(record: &bam::Record) -> Option<DateTime<FixedOffset>> {
     let tag = sam::alignment::record::data::field::Tag::new(b's', b't');
     match record.data().get(&tag) {
         Some(Ok(value)) => parse_start_time_value(&value),

@@ -22,8 +22,34 @@ pub fn run_filter(args: cli::FilterArgs) -> Result<()> {
         .as_deref()
         .map(parse_pore_range)
         .transpose()?;
+    
     let time_window = match (args.time_start.as_deref(), args.time_end.as_deref()) {
-        (Some(start), Some(end)) => Some(parse_time_window(start, end)?),
+        (Some(start), Some(end)) => {
+            if chrono::DateTime::parse_from_rfc3339(start.trim()).is_ok()
+                && chrono::DateTime::parse_from_rfc3339(end.trim()).is_ok()
+            {
+                Some(parse_time_window(start, end)?)
+            } else {
+                let (run_start, run_end) = if let Some(ref summary_path) = args.sequencing_summary {
+                    eprintln!("Scanning sequencing summary file for run timing baseline...");
+                    nanofilter_core::time_bounds::scan_sequencing_summary_bounds(summary_path)?
+                } else {
+                    eprintln!("Performing first-pass scan of input file for run timing baseline...");
+                    let input_str = args.input.to_string_lossy().to_lowercase();
+                    if input_str.ends_with(".bam") {
+                        nanofilter_core::time_bounds::scan_bam_bounds(&args.input, args.threads)?
+                    } else if is_fastq_path(&input_str) {
+                        nanofilter_core::time_bounds::scan_fastq_bounds(&args.input)?
+                    } else {
+                        bail!("Unsupported input format for automatic time-filtering scan");
+                    }
+                };
+                eprintln!("Discovered run baseline: start = {}, end = {}", run_start.to_rfc3339(), run_end.to_rfc3339());
+                let resolved = nanoseq_core::filters::resolve_relative_window(start, end, run_start, run_end)?;
+                eprintln!("Resolved relative time filter: start = {}, end = {}", resolved.start.to_rfc3339(), resolved.end.to_rfc3339());
+                Some(resolved)
+            }
+        }
         (None, None) => None,
         _ => bail!("Use both --time-start and --time-end together"),
     };
@@ -374,3 +400,44 @@ fn default_make_pe_prefix(input: &PathBuf, insert: usize, step: usize) -> PathBu
         .trim_end_matches(".fq");
     parent.join(format!("{}_{}_{}", base, insert, step))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+    use std::io::Write;
+
+    #[test]
+    fn test_cli_relative_time_parsing() {
+        let mut summary_file = NamedTempFile::new().unwrap();
+        writeln!(
+            summary_file,
+            "read_id\tchannel\tstart_time\tduration\nread1\t101\t2026-03-17 12:00:00\t10.0\nread2\t102\t2026-03-17 12:30:00\t15.0"
+        )
+        .unwrap();
+
+        // Construct mock FilterArgs
+        let _args = cli::FilterArgs {
+            input: PathBuf::from("mock.fastq"),
+            output: PathBuf::from("mock_out.fastq"),
+            qv: 7.0,
+            len: vec![],
+            output_format: "fastq".to_string(),
+            channel_range: None,
+            time_start: Some("10m".to_string()),
+            time_end: Some("-5m".to_string()),
+            threads: 4,
+            sequencing_summary: Some(summary_file.path().to_path_buf()),
+        };
+
+        // Resolve time window using our summary scanning
+        let (run_start, run_end) = nanofilter_core::time_bounds::scan_sequencing_summary_bounds(summary_file.path()).unwrap();
+        let resolved = nanoseq_core::filters::resolve_relative_window("10m", "-5m", run_start, run_end).unwrap();
+
+        let utc = chrono::FixedOffset::east_opt(0).unwrap();
+        use chrono::TimeZone;
+        assert_eq!(resolved.start, utc.with_ymd_and_hms(2026, 3, 17, 12, 10, 0).unwrap());
+        assert_eq!(resolved.end, utc.with_ymd_and_hms(2026, 3, 17, 12, 25, 0).unwrap());
+    }
+}
+

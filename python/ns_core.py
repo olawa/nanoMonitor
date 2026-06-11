@@ -149,9 +149,10 @@ def calculate_pore_stats(all_meta):
 # --- FILTERING ---
 class ReadFilter:
     """Handles filtering of BAM reads based on tags and properties."""
-    def __init__(self, min_qs=0, min_length=0, allow_unmapped=False, duplex_only=False):
+    def __init__(self, min_qs=0, min_length=0, max_length=0, allow_unmapped=False, duplex_only=False):
         self.min_qs = min_qs
         self.min_length = min_length
+        self.max_length = max_length
         self.allow_unmapped = allow_unmapped
         self.duplex_only = duplex_only
 
@@ -166,6 +167,8 @@ class ReadFilter:
             except KeyError:
                 return False
         if read.query_length < self.min_length:
+            return False
+        if self.max_length > 0 and read.query_length > self.max_length:
             return False
         if self.min_qs > 0:
             try:
@@ -286,6 +289,7 @@ class BaseStreamer:
         self.read_filter = ReadFilter(
             min_qs=filters.get("min_qs", 0),
             min_length=filters.get("min_len", 0),
+            max_length=filters.get("max_len", 0),
             allow_unmapped=allow_unmapped,
             duplex_only=filters.get("duplex_only", False)
         )

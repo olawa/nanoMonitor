@@ -96,6 +96,19 @@ class AnalysisWorker(QThread):
                     qc_only=self.config.get("qc_only", False),
                     primer_tolerance=self.primer_tolerance
                 )
+            elif self.mode == "DNA":
+                 res = ns_amplicon.run_analysis(
+                    self.bam_file, 
+                    None, 
+                    None, 
+                    self.filters,
+                    self.threads, 
+                    lambda p: self.progress.emit(p),
+                    collect_meta,
+                    self.isInterruptionRequested,
+                    qc_only=True,
+                    primer_tolerance=self.primer_tolerance
+                )
             elif self.mode == "RNA-Seq":
                  res = ns_rna.run_analysis(
                     self.bam_file,
@@ -486,7 +499,7 @@ class ExportWorker(QThread):
     error = pyqtSignal(str)
     
     def __init__(self, source_file, output_file, amplicon_names, primer_dict, 
-                 min_qs, min_len, duplex_only):
+                 min_qs, min_len, duplex_only, max_len=0):
         super().__init__()
         self.source_file = source_file
         self.output_file = output_file
@@ -494,6 +507,7 @@ class ExportWorker(QThread):
         self.primer_dict = primer_dict
         self.min_qs = min_qs
         self.min_len = min_len
+        self.max_len = max_len
         self.duplex_only = duplex_only
     
     def run(self):
@@ -550,6 +564,8 @@ class ExportWorker(QThread):
                 # Apply length filter
                 read_len = read.query_length if is_bam else len(read.sequence)
                 if read_len < self.min_len:
+                    continue
+                if self.max_len > 0 and read_len > self.max_len:
                     continue
                 
                 # Apply duplex filter

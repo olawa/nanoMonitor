@@ -6,6 +6,9 @@
 
 use anyhow::{Context, Result};
 use flate2::read::MultiGzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use std::io::Write;
 use nanoseq_core::format::{is_fastq_path, trim_line_ending};
 use nanoseq_core::quality::mean_qv_from_fastq_ascii;
 use rayon::prelude::*;
@@ -106,8 +109,9 @@ struct MatchResult {
 #[derive(Debug, Clone)]
 struct FastqRead {
     id: String,
+    header: String,
     seq: Vec<u8>,
-    qs: f32,
+    qual: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -482,7 +486,7 @@ fn match_fastq_read(
 ) -> MatchResult {
     let full_seq_bytes = &read.seq;
     let length = full_seq_bytes.len();
-    let quality = read.qs;
+    let quality = 0.0;
 
     let extract_len = std::cmp::min(length, end_length);
     let start_bytes = &full_seq_bytes[..extract_len];
@@ -592,92 +596,6 @@ fn match_fastq_read(
     }
 }
 
-fn read_fastq_from_reader<R: BufRead>(
-    mut reader: R,
-    min_qs: f32,
-    min_len: usize,
-    max_reads: usize,
-) -> Result<(Vec<FastqRead>, usize)> {
-    let mut reads = Vec::new();
-    let mut total_seen = 0usize;
-
-    let mut h = String::new();
-    let mut seq = String::new();
-    let mut plus = String::new();
-    let mut qual = String::new();
-
-    loop {
-        h.clear();
-        if reader.read_line(&mut h)? == 0 {
-            break;
-        }
-        if !h.starts_with('@') {
-            continue;
-        }
-        seq.clear();
-        plus.clear();
-        qual.clear();
-        if reader.read_line(&mut seq)? == 0
-            || reader.read_line(&mut plus)? == 0
-            || reader.read_line(&mut qual)? == 0
-        {
-            break;
-        }
-
-        total_seen += 1;
-
-        let seq_trim = trim_line_ending(&seq);
-        let qual_trim = trim_line_ending(&qual);
-        if seq_trim.len() != qual_trim.len() {
-            continue;
-        }
-
-        let len = seq_trim.len();
-        if len < min_len {
-            continue;
-        }
-        let qs = mean_qv_from_fastq_ascii(qual_trim.as_bytes()) as f32;
-        if qs < min_qs {
-            continue;
-        }
-
-        let id = trim_line_ending(&h)[1..]
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_string();
-        if id.is_empty() {
-            continue;
-        }
-
-        reads.push(FastqRead {
-            id,
-            seq: seq_trim.as_bytes().to_vec(),
-            qs,
-        });
-
-        if max_reads > 0 && reads.len() >= max_reads {
-            break;
-        }
-    }
-
-    Ok((reads, total_seen))
-}
-
-fn read_fastq_reads(
-    path: &str,
-    min_qs: f32,
-    min_len: usize,
-    max_reads: usize,
-) -> Result<(Vec<FastqRead>, usize)> {
-    let file = File::open(path).with_context(|| format!("Failed to open FASTQ file: {}", path))?;
-    if path.to_ascii_lowercase().ends_with(".gz") {
-        let gz = MultiGzDecoder::new(file);
-        read_fastq_from_reader(BufReader::new(gz), min_qs, min_len, max_reads)
-    } else {
-        read_fastq_from_reader(BufReader::new(file), min_qs, min_len, max_reads)
-    }
-}
 
 fn phred_to_accuracy_pct(qs: f64) -> f64 {
     let p_err = 10f64.powf(-qs / 10.0);
@@ -736,17 +654,6 @@ fn mode_from_bins(bins: &[DistributionBin]) -> f64 {
     }
 }
 
-fn build_distributions(match_results: &[MatchResult]) -> ReadDistributions {
-    let lengths = match_results
-        .iter()
-        .map(|r| r.length as f64)
-        .collect::<Vec<_>>();
-    let qs_vals = match_results
-        .iter()
-        .map(|r| r.quality as f64)
-        .collect::<Vec<_>>();
-    build_distributions_from_values(&lengths, &qs_vals)
-}
 
 fn build_distributions_from_values(lengths: &[f64], qs_vals: &[f64]) -> ReadDistributions {
     let mut lengths = lengths.to_vec();
@@ -784,6 +691,60 @@ fn build_distributions_from_values(lengths: &[f64], qs_vals: &[f64]) -> ReadDist
     }
 }
 
+fn is_fwd_rev_pair(p1: &str, p2: &str) -> bool {
+    let p1_lower = p1.to_lowercase();
+    let p2_lower = p2.to_lowercase();
+    let p1_is_fwd = p1_lower.contains("fwd") || p1_lower.contains("forward");
+    let p1_is_rev = p1_lower.contains("rev") || p1_lower.contains("reverse");
+    let p2_is_fwd = p2_lower.contains("fwd") || p2_lower.contains("forward");
+    let p2_is_rev = p2_lower.contains("rev") || p2_lower.contains("reverse");
+    (p1_is_fwd && p2_is_rev) || (p1_is_rev && p2_is_fwd)
+}
+
+fn parse_qs_from_header(header: &str) -> Option<f32> {
+    for part in header.split_whitespace().skip(1) {
+        if let Some((key, value)) = part.split_once('=') {
+            if key == "qs" {
+                if let Ok(v) = value.parse::<f32>() {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn get_split_path(base_path: &str, suffix: &str) -> String {
+    let path = std::path::Path::new(base_path);
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new(""));
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("output");
+    let (stem, ext) = if file_name.ends_with(".fastq.gz") {
+        (&file_name[..file_name.len() - 9], ".fastq.gz")
+    } else if file_name.ends_with(".fq.gz") {
+        (&file_name[..file_name.len() - 6], ".fq.gz")
+    } else if file_name.ends_with(".fastq") {
+        (&file_name[..file_name.len() - 6], ".fastq")
+    } else if file_name.ends_with(".fq") {
+        (&file_name[..file_name.len() - 3], ".fq")
+    } else {
+        (file_name, "")
+    };
+    let new_name = format!("{}_{}{}", stem, suffix, ext);
+    parent.join(new_name).to_string_lossy().to_string()
+}
+
+fn create_fastq_writer(path: &str) -> Result<Box<dyn std::io::Write>> {
+    let file = File::create(path).with_context(|| format!("Failed to create output file: {}", path))?;
+    if path.to_ascii_lowercase().ends_with(".gz") {
+        Ok(Box::new(GzEncoder::new(
+            std::io::BufWriter::new(file),
+            Compression::default(),
+        )))
+    } else {
+        Ok(Box::new(std::io::BufWriter::new(file)))
+    }
+}
+
 pub fn run_amplicons(
     bam_path: &str,
     primers_path: &str,
@@ -794,12 +755,60 @@ pub fn run_amplicons(
     print_summary: bool,
     primer_tolerance: i64,
     min_qs: f32,
-    min_len: usize,
+    len_range: (usize, usize),
     max_reads: usize,
     duplex_only: bool,
     reference: Option<&str>,
     gtf: Option<&str>,
+    output_fastq: Option<&str>,
+    output_dimers: Option<&str>,
+    split_by_amplicon: bool,
 ) -> Result<AmpliconResult> {
+    run_amplicons_with_callback(
+        bam_path,
+        primers_path,
+        threads,
+        mode,
+        max_edit_dist,
+        end_length,
+        print_summary,
+        primer_tolerance,
+        min_qs,
+        len_range,
+        max_reads,
+        duplex_only,
+        reference,
+        gtf,
+        output_fastq,
+        output_dimers,
+        split_by_amplicon,
+        |_| {},
+    )
+}
+
+pub fn run_amplicons_with_callback<F>(
+    bam_path: &str,
+    primers_path: &str,
+    threads: usize,
+    mode: MatchMode,
+    max_edit_dist: usize,
+    end_length: usize,
+    print_summary: bool,
+    primer_tolerance: i64,
+    min_qs: f32,
+    len_range: (usize, usize),
+    max_reads: usize,
+    duplex_only: bool,
+    reference: Option<&str>,
+    gtf: Option<&str>,
+    output_fastq: Option<&str>,
+    output_dimers: Option<&str>,
+    split_by_amplicon: bool,
+    mut progress_callback: F,
+) -> Result<AmpliconResult>
+where
+    F: FnMut(&AmpliconResult),
+{
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build_global()
@@ -825,59 +834,219 @@ pub fn run_amplicons(
             log::warn!("Coordinate mode requested for FASTQ; falling back to semiglobal mode");
         }
         log::info!("Reading FASTQ: {}", bam_path);
-        let (reads, total_seen) = read_fastq_reads(bam_path, min_qs, min_len, max_reads)?;
 
-        log::info!(
-            "Matching {} reads (seen={}, mode=semiglobal, dist={}, end={}, min_qs={}, min_len={})...",
-            reads.len(),
-            total_seen,
-            max_edit_dist,
-            end_length,
-            min_qs,
-            min_len
-        );
+        let file = File::open(bam_path).with_context(|| format!("Failed to open FASTQ file: {}", bam_path))?;
+        let mut reader: Box<dyn BufRead> = if bam_path.to_ascii_lowercase().ends_with(".gz") {
+            Box::new(BufReader::new(MultiGzDecoder::new(file)))
+        } else {
+            Box::new(BufReader::new(file))
+        };
 
-        let match_results: Vec<MatchResult> = reads
-            .par_iter()
-            .enumerate()
-            .map(|(i, r)| {
-                match_fastq_read(
-                    r,
-                    i,
-                    &primers,
-                    kmer_index.as_ref(),
-                    end_length,
-                    max_edit_dist,
-                    true,
-                    false,
-                )
-            })
-            .collect();
+        let mut main_fq_writer = if let Some(ref path) = output_fastq {
+            if !split_by_amplicon {
+                Some(create_fastq_writer(path)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
+        let mut dimers_fq_writer = if let Some(ref path) = output_dimers {
+            Some(create_fastq_writer(path)?)
+        } else {
+            None
+        };
+
+        let mut writers: HashMap<String, Box<dyn std::io::Write>> = HashMap::new();
+
+        let chunk_size = 500;
         let mut amplicons: HashMap<String, AmpliconStats> = HashMap::new();
         let mut primer_counts: HashMap<String, usize> = HashMap::new();
         let mut chimera_count = 0usize;
         let mut unmatched_count = 0usize;
+        let mut dist_lengths = Vec::<f64>::new();
+        let mut dist_qs = Vec::<f64>::new();
+        let mut total_reads = 0;
 
-        for res in &match_results {
-            if res.is_chimera {
-                chimera_count += 1;
-            }
-            if let Some(p) = &res.start_primer {
-                *primer_counts.entry(p.clone()).or_default() += 1;
-            }
-            if let Some(p) = &res.end_primer {
-                *primer_counts.entry(p.clone()).or_default() += 1;
+        loop {
+            let mut chunk = Vec::new();
+            let mut line = String::new();
+            let mut reached_eof = false;
+
+            for _ in 0..chunk_size {
+                if max_reads > 0 && total_reads >= max_reads {
+                    break;
+                }
+
+                line.clear();
+                if reader.read_line(&mut line)? == 0 {
+                    reached_eof = true;
+                    break;
+                }
+                let h = line.clone();
+
+                line.clear();
+                if reader.read_line(&mut line)? == 0 {
+                    reached_eof = true;
+                    break;
+                }
+                let seq = line.clone();
+
+                line.clear();
+                if reader.read_line(&mut line)? == 0 {
+                    reached_eof = true;
+                    break;
+                }
+
+                line.clear();
+                if reader.read_line(&mut line)? == 0 {
+                    reached_eof = true;
+                    break;
+                }
+                let qual = line.clone();
+
+                let seq_trim = trim_line_ending(&seq);
+                let qual_trim = trim_line_ending(&qual);
+                if seq_trim.len() != qual_trim.len() {
+                    continue;
+                }
+
+                let len = seq_trim.len();
+                if len < len_range.0 || len > len_range.1 {
+                    continue;
+                }
+
+                let id = trim_line_ending(&h)[1..]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                if id.is_empty() {
+                    continue;
+                }
+
+                chunk.push(FastqRead {
+                    id,
+                    header: h,
+                    seq: seq_trim.as_bytes().to_vec(),
+                    qual: qual_trim.as_bytes().to_vec(),
+                });
             }
 
-            if let Some(name) = &res.amplicon_name {
-                let stats = amplicons.entry(name.clone()).or_default();
-                stats.count += 1;
-                stats.lengths.push(res.length);
-                stats.qualities.push(res.quality);
-                stats.read_ids.push(reads[res.read_id_index].id.clone());
-            } else {
-                unmatched_count += 1;
+            if chunk.is_empty() {
+                break;
+            }
+
+            let chunk_results: Vec<MatchResult> = chunk
+                .par_iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    match_fastq_read(
+                        r,
+                        i,
+                        &primers,
+                        kmer_index.as_ref(),
+                        end_length,
+                        max_edit_dist,
+                        true,
+                        false,
+                    )
+                })
+                .collect();
+
+            for mut res in chunk_results {
+                total_reads += 1;
+                if res.is_chimera {
+                    chimera_count += 1;
+                }
+                if let Some(p) = &res.start_primer {
+                    *primer_counts.entry(p.clone()).or_default() += 1;
+                }
+                if let Some(p) = &res.end_primer {
+                    *primer_counts.entry(p.clone()).or_default() += 1;
+                }
+
+                if let Some(name) = &res.amplicon_name {
+                    let r = &chunk[res.read_id_index];
+                    let qs = if let Some(header_qs) = parse_qs_from_header(&r.header) {
+                        header_qs
+                    } else {
+                        mean_qv_from_fastq_ascii(&r.qual) as f32
+                    };
+
+                    if qs < min_qs {
+                        unmatched_count += 1;
+                        continue;
+                    }
+
+                    res.quality = qs;
+                    dist_lengths.push(res.length as f64);
+                    dist_qs.push(res.quality as f64);
+
+                    let is_valid = if let (Some(p1), Some(p2)) = (&res.start_primer, &res.end_primer) {
+                        is_fwd_rev_pair(p1, p2)
+                    } else {
+                        false
+                    };
+
+                    if is_valid {
+                        let stats = amplicons.entry(name.clone()).or_default();
+                        stats.count += 1;
+                        stats.lengths.push(res.length);
+                        stats.qualities.push(res.quality);
+                        stats.read_ids.push(r.id.clone());
+
+                        if let Some(ref out_path) = output_fastq {
+                            let writer = if split_by_amplicon {
+                                let path = get_split_path(out_path, name);
+                                writers.entry(name.clone()).or_insert_with(|| {
+                                    create_fastq_writer(&path).expect("Failed to create split FASTQ writer")
+                                })
+                            } else {
+                                main_fq_writer.as_mut().unwrap()
+                            };
+                            writer.write_all(b"@")?;
+                            writer.write_all(r.id.as_bytes())?;
+                            writer.write_all(b"\n")?;
+                            writer.write_all(&r.seq)?;
+                            writer.write_all(b"\n+\n")?;
+                            writer.write_all(&r.qual)?;
+                            writer.write_all(b"\n")?;
+                        }
+                    } else {
+                        unmatched_count += 1;
+                        if let Some(ref mut writer) = dimers_fq_writer {
+                            writer.write_all(b"@")?;
+                            writer.write_all(r.id.as_bytes())?;
+                            writer.write_all(b"\n")?;
+                            writer.write_all(&r.seq)?;
+                            writer.write_all(b"\n+\n")?;
+                            writer.write_all(&r.qual)?;
+                            writer.write_all(b"\n")?;
+                        }
+                    }
+                } else {
+                    unmatched_count += 1;
+                }
+            }
+
+            let mut current_amplicons = amplicons.clone();
+            for stats in current_amplicons.values_mut() {
+                stats.finalize();
+            }
+            let intermediate = AmpliconResult {
+                amplicons: current_amplicons,
+                chimera_count,
+                unmatched_count,
+                total_reads,
+                rescued_count: 0,
+                distributions: build_distributions_from_values(&dist_lengths, &dist_qs),
+            };
+            progress_callback(&intermediate);
+
+            if reached_eof || (max_reads > 0 && total_reads >= max_reads) {
+                break;
             }
         }
 
@@ -889,9 +1058,9 @@ pub fn run_amplicons(
             amplicons,
             chimera_count,
             unmatched_count,
-            total_reads: reads.len(),
+            total_reads,
             rescued_count: 0,
-            distributions: build_distributions(&match_results),
+            distributions: build_distributions_from_values(&dist_lengths, &dist_qs),
         };
 
         if print_summary {
@@ -943,7 +1112,8 @@ pub fn run_amplicons(
         if max_reads > 0 && total_processed >= max_reads {
             break;
         }
-        if record.seq_len() < min_len {
+        let seq_len = record.seq_len();
+        if seq_len < len_range.0 || seq_len > len_range.1 {
             continue;
         }
         let qs = qv_from_record(&record);
@@ -1016,6 +1186,22 @@ pub fn run_amplicons(
         } else {
             unassigned_results.push(PendingUnassigned { id: read_id, res });
         }
+
+        if total_seen % 500 == 0 {
+            let mut current_amplicons = amplicons.clone();
+            for stats in current_amplicons.values_mut() {
+                stats.finalize();
+            }
+            let intermediate = AmpliconResult {
+                amplicons: current_amplicons,
+                chimera_count,
+                unmatched_count: unassigned_results.len(),
+                total_reads: total_processed,
+                rescued_count: 0,
+                distributions: build_distributions_from_values(&dist_lengths, &dist_qs),
+            };
+            progress_callback(&intermediate);
+        }
     }
 
     log::info!(
@@ -1026,8 +1212,8 @@ pub fn run_amplicons(
         primer_tolerance,
         max_edit_dist,
         end_length,
-        min_qs,
-        min_len,
+        len_range.0,
+        len_range.1,
         duplex_only
     );
 
@@ -1098,6 +1284,7 @@ pub fn run_amplicons(
     } else {
         unmatched_count = unassigned_results.len();
     }
+
 
     if rescued_count > 0 {
         log::info!("Rescued {} reads using inferred coordinates", rescued_count);
@@ -1200,11 +1387,14 @@ pub fn run_amplicons_to_output(
     print_summary: bool,
     primer_tolerance: i64,
     min_qs: f32,
-    min_len: usize,
+    len_range: (usize, usize),
     max_reads: usize,
     duplex_only: bool,
     reference: Option<&str>,
     gtf: Option<&str>,
+    output_fastq: Option<&str>,
+    output_dimers: Option<&str>,
+    split_by_amplicon: bool,
 ) -> Result<()> {
     let result = run_amplicons(
         bam_path,
@@ -1216,11 +1406,14 @@ pub fn run_amplicons_to_output(
         print_summary,
         primer_tolerance,
         min_qs,
-        min_len,
+        len_range,
         max_reads,
         duplex_only,
         reference,
         gtf,
+        output_fastq,
+        output_dimers,
+        split_by_amplicon,
     )?;
     write_output(&result, output_path)?;
     Ok(())

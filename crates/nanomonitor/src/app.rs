@@ -1,16 +1,17 @@
+use crate::integrations::{self, ClinicalMutation};
 use crate::model::{
     AnalysisMode, DashboardData, FilterConfig, HistogramBin, MainTab, ResultRow, RunConfig,
-    RunSource,
+    RunSource, ThemeSkin, VariantRow,
 };
 use crate::nanostream_cli::NanostreamConfig;
-use crate::remote::{MonitorEvent, MonitorRequest, RemoteConfig, RemoteStatus};
+use crate::remote::{self, MonitorEvent, MonitorRequest, RemoteConfig, RemoteStatus};
 use eframe::egui::{self, Align, Color32, Layout, RichText, Stroke, Vec2};
-use egui_plot::{Bar, BarChart, Line, Plot, PlotPoints, Points};
+use egui_plot::{Bar, BarChart, Line, Plot, PlotPoints};
 use nanofilter_core::{bam as filter_bam, fastq as filter_fastq};
-use nanoparse_core::{MatchMode, matcher, matcher::AmpliconResult};
+use nanoparse_core::{MatchMode, matcher};
 use nanoseq_core::filters::parse_pore_range;
 use rfd::FileDialog;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -25,10 +26,22 @@ enum RunState {
 
 enum WorkerMessage {
     Log(String),
+    Progress {
+        input_path: String,
+        processed_reads: usize,
+        current_data: DashboardData,
+    },
     Completed {
         input_path: String,
         result: Result<DashboardData, String>,
     },
+    SnapCompleted {
+        path: String,
+    },
+    VariantsCompleted {
+        variants: Vec<VariantRow>,
+    },
+    Error(String),
 }
 
 enum MonitorMessage {
@@ -81,6 +94,25 @@ pub struct NanoMonitorApp {
     file_op_channel_range: String,
     barcode_file_path: String,
     barcode_output_dir: String,
+
+    // Premium Aesthetics & Integrations
+    active_theme: ThemeSkin,
+    theme_applied: bool,
+    clinical_db: HashMap<(String, u64), ClinicalMutation>,
+    tool_rs_qc: String,
+    tool_rindels: String,
+    remote_req_tx: Option<Sender<MonitorRequest>>,
+    remote_stop_tx: Option<Sender<()>>,
+    remote_rx: Option<Receiver<MonitorEvent>>,
+    
+    // Background pipelines state
+    snap_running: bool,
+    variant_calling_running: bool,
+    active_center_sub_tab: usize, // 0 = Histograms, 1 = Alignment Snapshot, 2 = Called Variants
+
+    accuracy_plot_hovered: bool,
+    qs_plot_hovered: bool,
+    len_plot_hovered: bool,
 }
 
 impl NanoMonitorApp {
@@ -166,9 +198,6 @@ impl NanoMonitorApp {
     }
 
     fn validate_run_prerequisites(&mut self) -> Result<(), String> {
-        if self.mode != AnalysisMode::Amplicon {
-            return Err("Only Amplicon mode is wired to nanostream for now".into());
-        }
         if !self.filters.use_nanostream {
             return Err("Enable 'Use Rust (nanostream)' to run analysis".into());
         }
@@ -331,7 +360,7 @@ impl NanoMonitorApp {
                 }
 
                 let mut files = Vec::new();
-                NanoMonitorApp::collect_data_files(&dir_for_thread, &mut files);
+                Self::collect_data_files(&dir_for_thread, &mut files);
                 for p in files {
                     let s = p.to_string_lossy().to_string();
                     if known.insert(s.clone()) {
@@ -410,9 +439,12 @@ impl NanoMonitorApp {
             (!self.reference_path.trim().is_empty()).then(|| self.reference_path.clone());
         let gtf = (!self.gtf_path.trim().is_empty()).then(|| self.gtf_path.clone());
 
+        let tx_progress = tx.clone();
+        let input_path_clone = input_path.clone();
+
         thread::spawn(move || {
             let _ = tx.send(WorkerMessage::Log(format!("CLI preview> {}", command_line)));
-            let result = match matcher::run_amplicons(
+            let result = match matcher::run_amplicons_with_callback(
                 &input_path,
                 &primers_path,
                 threads,
@@ -422,18 +454,164 @@ impl NanoMonitorApp {
                 true,
                 primer_tolerance,
                 min_qs,
-                min_len,
+                (min_len, usize::MAX),
                 max_reads,
                 duplex_only,
                 reference.as_deref(),
                 gtf.as_deref(),
+                None,
+                None,
+                false,
+                |intermediate| {
+                    let new_data = build_dashboard_from_nanostream(intermediate);
+                    let _ = tx_progress.send(WorkerMessage::Progress {
+                        input_path: input_path_clone.clone(),
+                        processed_reads: intermediate.total_reads,
+                        current_data: new_data,
+                    });
+                }
             ) {
-                Ok(parsed) => Ok(build_dashboard_from_nanostream(parsed)),
+                Ok(parsed) => Ok(build_dashboard_from_nanostream(&parsed)),
                 Err(e) => Err(format!("nanostream core failed: {}", e)),
             };
 
             let _ = tx.send(WorkerMessage::Completed { input_path, result });
         });
+    }
+
+    fn trigger_region_snapshot(&mut self) {
+        let row_idx = match self.data.selected_row {
+            Some(i) => i,
+            None => {
+                self.log_lines.push("Select an amplicon row in the table first".into());
+                return;
+            }
+        };
+        let region = self.data.rows[row_idx].amplicon_name.clone();
+        let input_bam = match self.selected_file_for_operations() {
+            Ok(path) => path,
+            Err(e) => {
+                self.log_lines.push(format!("Cannot generate snapshot: {}", e));
+                return;
+            }
+        };
+
+        if !input_bam.to_ascii_lowercase().ends_with(".bam") {
+            self.log_lines.push("Snapshot generation requires a loaded BAM file".into());
+            return;
+        }
+
+        self.snap_running = true;
+        self.log_lines.push(format!("Queued rs-qc snapshot for amplicon: {}", region));
+        
+        // We can spawn a quick thread sending results back to worker channel if mapped, or log it.
+        // Let's create a dynamic channel.
+        let worker_tx = self.create_worker_sender_if_none();
+
+        let rs_qc_bin = self.tool_rs_qc.clone();
+        let gtf = self.gtf_path.clone();
+        let reference = self.reference_path.clone();
+        
+        // Output folder snapshot setup
+        let output_folder = Path::new("snapshots");
+        let _ = fs::create_dir_all(output_folder);
+        let clean_name = region.replace(':', "_").replace('-', "_");
+        let output_png = output_folder.join(format!("{}_snapshot.png", clean_name));
+        let output_png_str = output_png.to_string_lossy().to_string();
+
+        thread::spawn(move || {
+            match integrations::run_rs_qc_snap(&rs_qc_bin, &input_bam, &region, &gtf, &reference, &output_png_str) {
+                Ok(_) => {
+                    let _ = worker_tx.send(WorkerMessage::SnapCompleted { path: output_png_str });
+                }
+                Err(e) => {
+                    let _ = worker_tx.send(WorkerMessage::Error(format!("rs-qc Snap failed: {}", e)));
+                }
+            }
+        });
+    }
+
+    fn trigger_variant_calling(&mut self) {
+        let row_idx = match self.data.selected_row {
+            Some(i) => i,
+            None => {
+                self.log_lines.push("Select an amplicon row in the table first".into());
+                return;
+            }
+        };
+        let region = self.data.rows[row_idx].amplicon_name.clone();
+        let input_bam = match self.selected_file_for_operations() {
+            Ok(path) => path,
+            Err(e) => {
+                self.log_lines.push(format!("Cannot call variants: {}", e));
+                return;
+            }
+        };
+
+        if !input_bam.to_ascii_lowercase().ends_with(".bam") {
+            self.log_lines.push("Variant calling requires a mapped BAM file".into());
+            return;
+        }
+
+        self.variant_calling_running = true;
+        self.log_lines.push(format!("Queued rindels variant calling for: {}", region));
+
+        let worker_tx = self.create_worker_sender_if_none();
+        
+        let rindels_bin = self.tool_rindels.clone();
+        let reference = self.reference_path.clone();
+        let clinical_db = self.clinical_db.clone();
+
+        thread::spawn(move || {
+            // Write temporary BED file containing the region if parsed, or format a quick bed file
+            let bed_path = "temp_amplicon.bed";
+            // Simple VCF output setup
+            let output_vcf = "temp_variants.vcf";
+            
+            // Format Region to BED format chrom \t start \t end
+            let mut parts = region.split(':');
+            let bed_content = if let Some(chrom) = parts.next() {
+                if let Some(range) = parts.next() {
+                    let mut coords = range.split('-');
+                    let start = coords.next().unwrap_or("0");
+                    let end = coords.next().unwrap_or("0");
+                    format!("{}\t{}\t{}\n", chrom, start, end)
+                } else {
+                    format!("{}\t0\t500000000\n", chrom)
+                }
+            } else {
+                format!("{}\t0\t500000000\n", region)
+            };
+            let _ = fs::write(bed_path, bed_content);
+
+            match integrations::run_rindels(&rindels_bin, &input_bam, &reference, bed_path, output_vcf) {
+                Ok(_) => {
+                    // Parse VCF
+                    match integrations::parse_vcf(output_vcf, &clinical_db) {
+                        Ok(vars) => {
+                            let _ = worker_tx.send(WorkerMessage::VariantsCompleted { variants: vars });
+                        }
+                        Err(e) => {
+                            let _ = worker_tx.send(WorkerMessage::Error(format!("VCF Parsing failed: {}", e)));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = worker_tx.send(WorkerMessage::Error(format!("rindels calling failed: {}", e)));
+                }
+            }
+            
+            // Cleanup temp files
+            let _ = fs::remove_file(bed_path);
+            let _ = fs::remove_file(output_vcf);
+        });
+    }
+
+    fn create_worker_sender_if_none(&mut self) -> Sender<WorkerMessage> {
+        let (tx, rx) = mpsc::channel::<WorkerMessage>();
+        // Add rx to worker channel checks
+        self.worker_rx = Some(rx);
+        tx
     }
 
     fn pick_input_file(&mut self) {
@@ -443,6 +621,13 @@ impl NanoMonitorApp {
         {
             self.run.source = RunSource::SingleFile;
             self.run.input_path = path.to_string_lossy().to_string();
+            self.data = DashboardData::empty();
+            self.processed_files.clear();
+            self.failed_files.clear();
+            self.pending_files.clear();
+            self.queued_files.clear();
+            self.current_input = None;
+            self.last_error = None;
         }
     }
 
@@ -682,7 +867,9 @@ impl NanoMonitorApp {
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>, startup: AppStartupConfig) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::light());
+        // Bio-Teal (Dark) is the default stunning aesthetic
+        let default_theme = ThemeSkin::BioTeal;
+
         let mut app = Self {
             mode: startup.mode.unwrap_or(AnalysisMode::Amplicon),
             tab: MainTab::Results,
@@ -694,9 +881,9 @@ impl NanoMonitorApp {
             gtf_path: String::new(),
             data: DashboardData::empty(),
             log_lines: vec![
-                "nanoMonitor initialized".into(),
-                "Ready for local and remote analysis".into(),
-                "Press Start Monitor to run nanostream and refresh distributions".into(),
+                "nanoMonitor PCR Suite initialized".into(),
+                "Ready for local and remote amplicon analysis".into(),
+                "Select data inputs and press Start Monitor.".into(),
             ],
             run_state: RunState::Idle,
             worker_rx: None,
@@ -716,6 +903,22 @@ impl NanoMonitorApp {
             file_op_channel_range: String::new(),
             barcode_file_path: String::new(),
             barcode_output_dir: String::new(),
+
+            // Aesthetic themes and integrations defaults
+            active_theme: default_theme,
+            theme_applied: false,
+            clinical_db: integrations::load_clinical_mutations(),
+            tool_rs_qc: String::new(),
+            tool_rindels: String::new(),
+            remote_req_tx: None,
+            remote_stop_tx: None,
+            remote_rx: None,
+            snap_running: false,
+            variant_calling_running: false,
+            active_center_sub_tab: 0,
+            accuracy_plot_hovered: false,
+            qs_plot_hovered: false,
+            len_plot_hovered: false,
         };
 
         if let Some(bin) = startup.nanostream_bin {
@@ -747,6 +950,9 @@ impl NanoMonitorApp {
         if startup.run_on_start {
             app.start_monitor();
         }
+        
+        apply_theme_visuals(&cc.egui_ctx, default_theme);
+        app.theme_applied = true;
         app
     }
 
@@ -847,42 +1053,110 @@ impl NanoMonitorApp {
             }
         }
 
+        // Poll LAN Remote channel
+        if let Some(rx) = &self.remote_rx {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    MonitorEvent::Pong => {
+                        self.remote.status = RemoteStatus::Connected;
+                        self.log_lines.push("Remote LAN node connected!".into());
+                    }
+                    MonitorEvent::Progress { reads_processed, percent } => {
+                        self.data.total_reads = reads_processed;
+                        self.log_lines.push(format!("Remote progress: {} reads ({:.1}%)", reads_processed, percent));
+                    }
+                    MonitorEvent::ResultSummary { total_reads, filtered_reads } => {
+                        self.data.total_reads = total_reads;
+                        self.data.filtered_reads = filtered_reads;
+                        self.log_lines.push(format!("Remote Summary: Total={}, Filtered={}", total_reads, filtered_reads));
+                    }
+                    MonitorEvent::Error { message } => {
+                        if message.contains("Connection failed") || message.contains("closed") {
+                            self.remote.status = RemoteStatus::Disconnected;
+                        }
+                        self.last_error = Some(message.clone());
+                        self.log_lines.push(format!("Remote error: {}", message));
+                    }
+                }
+            }
+        }
+
         let mut completed = false;
         let mut completed_path: Option<String> = None;
         let mut completed_ok = false;
+        
+        let mut worker_msgs = Vec::new();
         if let Some(rx) = &self.worker_rx {
             while let Ok(msg) = rx.try_recv() {
-                match msg {
-                    WorkerMessage::Log(line) => {
-                        for chunk in line.lines() {
-                            self.log_lines.push(chunk.to_string());
+                worker_msgs.push(msg);
+            }
+        }
+        for msg in worker_msgs {
+            match msg {
+                WorkerMessage::Log(line) => {
+                    for chunk in line.lines() {
+                        self.log_lines.push(chunk.to_string());
+                    }
+                }
+                WorkerMessage::Progress { input_path, processed_reads: _, current_data } => {
+                    self.data = current_data;
+                    self.data.accumulated_files = 1;
+                    self.current_input = Some(input_path);
+                }
+                WorkerMessage::Completed { input_path, result } => {
+                    completed = true;
+                    completed_path = Some(input_path.clone());
+                    self.run_state = RunState::Idle;
+                    match result {
+                        Ok(new_data) => {
+                            completed_ok = true;
+                            self.last_error = None;
+                            self.log_lines.push(format!("Analysis complete: {}", input_path));
+                            
+                            // Dynamic stats aggregation for live watch mode
+                            if self.run.source == RunSource::MonitorDirectory && self.data.accumulated_files > 0 {
+                                self.log_lines.push("Merging statistics with existing run data".into());
+                                self.data.merge(new_data);
+                            } else {
+                                self.data = new_data;
+                                self.data.accumulated_files = 1;
+                            }
+
+                            if self.run.auto_scan_variants {
+                                self.log_lines.push("Auto-variant calling sequence queued".into());
+                                self.trigger_variant_calling();
+                            }
+                        }
+                        Err(err) => {
+                            self.last_error = Some(err.clone());
+                            self.log_lines.push(format!("Analysis failed for {}: {}", input_path, err));
                         }
                     }
-                    WorkerMessage::Completed { input_path, result } => {
-                        completed = true;
-                        completed_path = Some(input_path.clone());
-                        self.run_state = RunState::Idle;
-                        match result {
-                            Ok(data) => {
-                                self.data = data;
-                                completed_ok = true;
-                                self.last_error = None;
-                                self.log_lines
-                                    .push(format!("Analysis complete: {}", input_path));
-                                if self.run.auto_scan_variants {
-                                    self.log_lines.push(format!(
-                                        "Auto-variant hook queued for {} (implementation pending)",
-                                        input_path
-                                    ));
-                                }
-                            }
-                            Err(err) => {
-                                self.last_error = Some(err.clone());
-                                self.log_lines
-                                    .push(format!("Analysis failed for {}: {}", input_path, err));
-                            }
+                }
+                WorkerMessage::SnapCompleted { path } => {
+                    self.snap_running = false;
+                    self.data.snapshot_img_path = Some(path);
+                    self.log_lines.push("rs-qc Alignment snapshot generation complete".into());
+                    self.active_center_sub_tab = 0; // Switch tab to alignment snapshot view
+                }
+                WorkerMessage::VariantsCompleted { variants } => {
+                    self.variant_calling_running = false;
+                    self.data.variants = variants;
+                    self.log_lines.push("rindels Variant calling pipeline complete".into());
+                    
+                    // Update result row variants count
+                    if let Some(idx) = self.data.selected_row {
+                        if let Some(row) = self.data.rows.get_mut(idx) {
+                            row.variants = self.data.variants.len() as u32;
                         }
                     }
+                    self.active_center_sub_tab = 1; // Switch tab to variants view
+                }
+                WorkerMessage::Error(err) => {
+                    self.snap_running = false;
+                    self.variant_calling_running = false;
+                    self.last_error = Some(err.clone());
+                    self.log_lines.push(format!("Background pipeline failed: {}", err));
                 }
             }
         }
@@ -897,7 +1171,7 @@ impl NanoMonitorApp {
                 }
             }
             self.maybe_start_next_analysis();
-        } else if self.run_state == RunState::Running {
+        } else if self.run_state == RunState::Running || self.snap_running || self.variant_calling_running {
             ctx.request_repaint();
         } else if self.monitor_active && !self.pending_files.is_empty() {
             self.maybe_start_next_analysis();
@@ -909,37 +1183,37 @@ impl NanoMonitorApp {
         ui.horizontal(|ui| {
             ui.heading("nanoMonitor");
             ui.label(
-                RichText::new("Rust / egui prototype")
-                    .color(Color32::from_rgb(70, 70, 70))
+                RichText::new("PCR Amplicon Suite")
+                    .color(Color32::from_rgb(120, 120, 125))
                     .small(),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let run_label = if self.monitor_active {
-                    "Run: Monitoring"
+                    "Watcher: Monitoring Run"
                 } else {
                     match self.run_state {
-                        RunState::Idle => "Run: Idle",
-                        RunState::Running => "Run: Running",
+                        RunState::Idle => "Watcher: Idle",
+                        RunState::Running => "Watcher: Running Analysis",
                     }
                 };
                 ui.colored_label(
                     if self.run_state == RunState::Running || self.monitor_active {
-                        Color32::from_rgb(210, 140, 20)
+                        Color32::from_rgb(45, 212, 191) // Biotech Teal highlight
                     } else {
-                        Color32::from_rgb(70, 70, 70)
+                        Color32::from_rgb(120, 120, 125)
                     },
                     run_label,
                 );
                 ui.separator();
                 let (color, label) = match self.remote.status {
                     RemoteStatus::Connected => {
-                        (Color32::from_rgb(34, 139, 34), "Remote: Connected")
+                        (Color32::from_rgb(45, 212, 191), "Remote Node: Connected")
                     }
                     RemoteStatus::Connecting => {
-                        (Color32::from_rgb(210, 140, 20), "Remote: Connecting")
+                        (Color32::from_rgb(234, 179, 8), "Remote Node: Connecting...")
                     }
                     RemoteStatus::Disconnected => {
-                        (Color32::from_rgb(160, 40, 40), "Remote: Offline")
+                        (Color32::from_rgb(239, 68, 68), "Remote Node: Offline")
                     }
                 };
                 ui.colored_label(color, label);
@@ -948,60 +1222,79 @@ impl NanoMonitorApp {
         ui.separator();
     }
 
-    fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
+    fn draw_sidebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
 
+        // Visual Theme Skin selector
         ui.group(|ui| {
-            ui.label(RichText::new("Mode").strong());
-            egui::ComboBox::from_id_salt("mode_combo")
-                .selected_text(self.mode.label())
+            ui.label(RichText::new("Aesthetics & Theme Skin").strong());
+            let current_skin_label = self.active_theme.label();
+            
+            let mut changed = false;
+            egui::ComboBox::from_id_salt("theme_selector_combobox")
+                .selected_text(current_skin_label)
                 .show_ui(ui, |ui| {
-                    for mode in AnalysisMode::ALL {
-                        ui.selectable_value(&mut self.mode, mode, mode.label());
+                    for theme in ThemeSkin::ALL {
+                        if ui.selectable_value(&mut self.active_theme, theme, theme.label()).clicked() {
+                            changed = true;
+                        }
                     }
                 });
+
+            if changed {
+                apply_theme_visuals(ctx, self.active_theme);
+                self.log_lines.push(format!("Interface theme set to: {}", self.active_theme.label()));
+            }
         });
 
+        // Loaded inputs & annotation resources
         ui.group(|ui| {
-            ui.label(RichText::new("Resources").strong());
-            if ui.button("Load Primers").clicked() {
-                self.pick_primers_file();
-            }
-            if ui.button("Load GTF/BED").clicked() {
-                self.pick_gtf_file();
-            }
-            if ui.button("Load Reference FASTA").clicked() {
-                self.pick_reference_file();
-            }
+            ui.label(RichText::new("Annotation Resources").strong());
+            
             ui.horizontal(|ui| {
-                ui.label("nanostream binary:");
-                ui.text_edit_singleline(&mut self.nanostream.executable);
-            });
-            ui.horizontal(|ui| {
-                ui.label("primers file:");
+                ui.label("Primers TSV:");
                 ui.text_edit_singleline(&mut self.nanostream.primers_path);
                 if ui.button("...").clicked() {
                     self.pick_primers_file();
                 }
             });
             ui.horizontal(|ui| {
-                ui.label("reference:");
+                ui.label("Ref FASTA:");
                 ui.text_edit_singleline(&mut self.reference_path);
                 if ui.button("...").clicked() {
                     self.pick_reference_file();
                 }
             });
             ui.horizontal(|ui| {
-                ui.label("gtf/bed:");
+                ui.label("GTF / BED:");
                 ui.text_edit_singleline(&mut self.gtf_path);
                 if ui.button("...").clicked() {
                     self.pick_gtf_file();
                 }
             });
+            ui.label(format!("Clinical Mutations Loaded: {} entries", self.clinical_db.len()));
         });
 
+        // Pipeline Tool Executables Paths configuration
+        ui.collapsing("Pipeline Tool Paths", |ui| {
+            ui.label("Local directories override PATH lookup:");
+            ui.horizontal(|ui| {
+                ui.label("nanostream:");
+                ui.text_edit_singleline(&mut self.nanostream.executable);
+            });
+            ui.horizontal(|ui| {
+                ui.label("rs-qc:");
+                ui.text_edit_singleline(&mut self.tool_rs_qc);
+            });
+            ui.horizontal(|ui| {
+                ui.label("rindels:");
+                ui.text_edit_singleline(&mut self.tool_rindels);
+            });
+        });
+
+        // Sequence run watcher controls
         ui.group(|ui| {
-            ui.label(RichText::new("Run Control").strong());
+            ui.label(RichText::new("Amplicon Run Control").strong());
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.run.source, RunSource::SingleFile, "Single File");
                 ui.selectable_value(
@@ -1010,21 +1303,41 @@ impl NanoMonitorApp {
                     "Monitor Dir",
                 );
             });
-            ui.label("Input path");
-            ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut self.run.input_path);
-                if ui.button("Browse").clicked() {
-                    self.pick_input_file();
+            
+            match self.run.source {
+                RunSource::SingleFile => {
+                    ui.label("Sequencing Input file (.bam / .fastq)");
+                    ui.horizontal(|ui| {
+                        let prev_path = self.run.input_path.clone();
+                        if ui.text_edit_singleline(&mut self.run.input_path).changed() {
+                            if self.run.input_path != prev_path {
+                                self.data = DashboardData::empty();
+                                self.processed_files.clear();
+                                self.failed_files.clear();
+                                self.pending_files.clear();
+                                self.queued_files.clear();
+                                self.current_input = None;
+                                self.last_error = None;
+                            }
+                        }
+                        if ui.button("Browse").clicked() {
+                            self.pick_input_file();
+                        }
+                    });
                 }
-            });
-            ui.label("Monitor directory");
-            ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut self.run.monitor_dir);
-                if ui.button("Browse").clicked() {
-                    self.pick_monitor_dir();
+                RunSource::MonitorDirectory => {
+                    ui.label("Live monitoring directory");
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.run.monitor_dir);
+                        if ui.button("Browse").clicked() {
+                            self.pick_monitor_dir();
+                        }
+                    });
+                    ui.label(format!("Accumulated Files: {}", self.data.accumulated_files));
                 }
-            });
-            ui.checkbox(&mut self.run.auto_scan_variants, "Auto-scan variants");
+            }
+
+            ui.checkbox(&mut self.run.auto_scan_variants, "Auto-variant calling hook");
             ui.label(format!(
                 "Queue: {} | Processed: {} | Failed: {}",
                 self.pending_files.len(),
@@ -1033,12 +1346,18 @@ impl NanoMonitorApp {
             ));
             if let Some(err) = &self.last_error {
                 ui.colored_label(
-                    Color32::from_rgb(170, 35, 35),
-                    format!("Last error: {}", err),
+                    Color32::from_rgb(239, 68, 68),
+                    format!("Last failure: {}", err),
                 );
             }
             if let Some(current) = &self.current_input {
-                ui.label(format!("Current: {}", current));
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!("Processing: {}", current));
+                });
+                if self.data.total_reads > 0 {
+                    ui.label(format!("Analyzed so far: {} reads", self.data.total_reads));
+                }
             }
             ui.horizontal(|ui| {
                 if ui
@@ -1062,119 +1381,56 @@ impl NanoMonitorApp {
             });
         });
 
+        // Remote LAN streaming configuration
         ui.group(|ui| {
-            ui.label(RichText::new("File Ops").strong());
-            ui.label("Filter/export output");
-            ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut self.file_op_output_path);
-                if ui.button("Browse").clicked() {
-                    self.pick_filter_output_file();
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Channel range");
-                ui.text_edit_singleline(&mut self.file_op_channel_range);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Max len");
-                ui.add(egui::DragValue::new(&mut self.file_op_max_len).speed(10.0));
-                ui.label("0 = no max");
-            });
-            if ui
-                .add_enabled(!self.file_op_running, egui::Button::new("Filter / Extract"))
-                .clicked()
-            {
-                self.start_filter_export();
-            }
-
-            ui.separator();
-            ui.label("Barcode file");
-            ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut self.barcode_file_path);
-                if ui.button("Browse").clicked() {
-                    self.pick_barcodes_file();
-                }
-            });
-            ui.label("Barcode output dir");
-            ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut self.barcode_output_dir);
-                if ui.button("Browse").clicked() {
-                    self.pick_barcode_output_dir();
-                }
-            });
-            if ui
-                .add_enabled(!self.file_op_running, egui::Button::new("Split Barcodes"))
-                .clicked()
-            {
-                self.start_barcode_split();
-            }
-        });
-
-        ui.group(|ui| {
-            ui.label(RichText::new("Remote (Secondary)").strong());
-            ui.checkbox(&mut self.remote.enabled, "Enable remote server");
-            ui.label("Endpoint");
+            ui.label(RichText::new("LAN Remote Streaming").strong());
+            ui.checkbox(&mut self.remote.enabled, "Enable LAN client");
+            ui.label("Node Endpoint");
             ui.text_edit_singleline(&mut self.remote.endpoint);
-            ui.label("Token");
+            ui.label("Secret Handshake Token");
             ui.add(egui::TextEdit::singleline(&mut self.remote.auth_token).password(true));
+            
             ui.horizontal(|ui| {
                 if ui.button("Connect").clicked() {
                     self.remote.status = RemoteStatus::Connecting;
-                    self.log_lines
-                        .push(format!("Connecting to {}", self.remote.endpoint));
-                    if let Ok(msg) = serde_json::to_string(&MonitorRequest::Ping) {
-                        self.log_lines.push(format!("Protocol example -> {}", msg));
-                    }
-                    self.remote.status = RemoteStatus::Connected;
-                    let ack = MonitorEvent::Pong;
-                    if let Ok(msg) = serde_json::to_string(&ack) {
-                        self.log_lines
-                            .push(format!("Remote event example <- {}", msg));
-                    }
+                    self.log_lines.push(format!("Connecting to LAN node: {}", self.remote.endpoint));
+                    
+                    let (tx, rx) = mpsc::channel::<MonitorEvent>();
+                    self.remote_rx = Some(rx);
+                    let (req_tx, stop_tx) = remote::spawn_remote_client(
+                        self.remote.endpoint.clone(),
+                        self.remote.auth_token.clone(),
+                        tx,
+                    );
+                    self.remote_req_tx = Some(req_tx);
+                    self.remote_stop_tx = Some(stop_tx);
                 }
                 if ui.button("Disconnect").clicked() {
+                    if let Some(stop_tx) = self.remote_stop_tx.take() {
+                        let _ = stop_tx.send(());
+                    }
                     self.remote.status = RemoteStatus::Disconnected;
-                    self.log_lines.push("Disconnected".into());
+                    self.remote_rx = None;
+                    self.remote_req_tx = None;
+                    self.log_lines.push("LAN connection closed".into());
                 }
             });
             ui.label(format!("Status: {}", self.remote.status.label()));
-        });
-
-        ui.group(|ui| {
-            ui.label(RichText::new("Quick Actions").strong());
-            ui.horizontal(|ui| {
-                let _ = ui.button("Snap");
-                let _ = ui.button("Variants");
-                let _ = ui.button("Matrix");
-            });
         });
     }
 
     fn draw_filter_strip(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Interactive Filters").strong());
+                ui.label(RichText::new("Interactive Quality Filters").strong());
                 ui.add(egui::DragValue::new(&mut self.filters.min_qs).speed(0.1).prefix("Min QS "));
                 ui.add(egui::DragValue::new(&mut self.filters.min_len).speed(10.0).prefix("Min Len "));
                 ui.add(egui::DragValue::new(&mut self.filters.max_reads).speed(100.0).prefix("Max Reads "));
                 ui.label(RichText::new("(0 = all reads)").small());
                 ui.checkbox(&mut self.filters.duplex_only, "Duplex only");
-                ui.checkbox(&mut self.filters.use_nanostream, "Use Rust (nanostream)");
+                ui.checkbox(&mut self.filters.use_nanostream, "Use Rust core (nanostream)");
                 if ui.button("Recalculate").clicked() {
-                    self.log_lines
-                        .push("Recalculate requested with current filters".into());
-                }
-                if ui.button("Auto-Variant").clicked() {
-                    self.run.auto_scan_variants = true;
-                    self.log_lines.push(
-                        "Auto-Variant enabled. Variant pipeline hook will run after successful analysis."
-                            .into(),
-                    );
-                }
-                if ui.button("Run Duplex Discovery").clicked() {
-                    self.log_lines.push(
-                        "Duplex discovery action requested (backend hook pending)".into(),
-                    );
+                    self.log_lines.push("Recalculate requested with updated quality thresholds".into());
                 }
             });
         });
@@ -1182,74 +1438,54 @@ impl NanoMonitorApp {
 
     fn draw_result_table(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.tab, MainTab::Results, "Results");
-            ui.selectable_value(&mut self.tab, MainTab::Log, "Log");
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("Build nanostream command").clicked() {
-                    match self.resolve_run_input_path() {
-                        Ok(path) => {
-                            let mut cmd = self.nanostream.build_amplicon_command(
-                                &path,
-                                &self.filters,
-                                Some(self.reference_path.as_str()),
-                                Some(self.gtf_path.as_str()),
-                            );
-                            match self.resolve_nanostream_executable() {
-                                Ok(bin) => {
-                                    cmd.program = bin;
-                                    self.log_lines.push(format!("CLI> {}", cmd.as_shell_line()));
-                                }
-                                Err(msg) => {
-                                    self.last_error = Some(msg.clone());
-                                    self.log_lines
-                                        .push(format!("Cannot build command: {}", msg));
-                                }
-                            }
-                        }
-                        Err(msg) => self
-                            .log_lines
-                            .push(format!("Cannot build command: {}", msg)),
-                    }
-                }
-            });
+            ui.selectable_value(&mut self.tab, MainTab::Results, "Dashboard Table");
+            ui.selectable_value(&mut self.tab, MainTab::Log, "Diagnostic logs");
         });
         ui.separator();
 
         match self.tab {
             MainTab::Results => {
                 egui::ScrollArea::vertical()
-                    .max_height(340.0)
+                    .max_height(260.0)
                     .show(ui, |ui| {
-                        let stroke = Stroke::new(1.0, Color32::from_gray(210));
+                        let text_color = ui.visuals().widgets.noninteractive.fg_stroke.color;
+                        let stroke = Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+                        
                         egui::Frame::default().stroke(stroke).show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.add_sized(
-                                    [28.0, 18.0],
+                                    [40.0, 18.0],
                                     egui::Label::new(RichText::new("#").strong()),
                                 );
+                                ui.separator();
                                 ui.add_sized(
-                                    [560.0, 18.0],
-                                    egui::Label::new(RichText::new("Amplicon Name").strong()),
+                                    [400.0, 18.0],
+                                    egui::Label::new(RichText::new("PCR Target Amplicon Name").strong()),
                                 );
+                                ui.separator();
                                 ui.add_sized(
-                                    [80.0, 18.0],
-                                    egui::Label::new(RichText::new("Count").strong()),
+                                    [100.0, 18.0],
+                                    egui::Label::new(RichText::new("Read Count").strong()),
                                 );
+                                ui.separator();
                                 ui.add_sized(
-                                    [90.0, 18.0],
-                                    egui::Label::new(RichText::new("Med Len").strong()),
+                                    [110.0, 18.0],
+                                    egui::Label::new(RichText::new("Median Length").strong()),
                                 );
+                                ui.separator();
                                 ui.add_sized(
-                                    [80.0, 18.0],
-                                    egui::Label::new(RichText::new("SD Len").strong()),
+                                    [100.0, 18.0],
+                                    egui::Label::new(RichText::new("SD Length").strong()),
                                 );
+                                ui.separator();
                                 ui.add_sized(
-                                    [80.0, 18.0],
-                                    egui::Label::new(RichText::new("Avg QS").strong()),
+                                    [100.0, 18.0],
+                                    egui::Label::new(RichText::new("Avg Q-Score").strong()),
                                 );
+                                ui.separator();
                                 ui.add_sized(
-                                    [80.0, 18.0],
-                                    egui::Label::new(RichText::new("Vars").strong()),
+                                    [100.0, 18.0],
+                                    egui::Label::new(RichText::new("Called Variants").strong()),
                                 );
                             });
                             ui.separator();
@@ -1257,46 +1493,68 @@ impl NanoMonitorApp {
                             if self.data.rows.is_empty() {
                                 ui.label(
                                     RichText::new(
-                                        "No results yet. Select input and press Start Monitor.",
+                                        "No amplicon matches loaded. Start monitor/load inputs to process BAM/FASTQ sequencing files.",
                                     )
-                                    .italics(),
+                                    .italics()
+                                    .color(Color32::from_rgb(120, 120, 120)),
                                 );
                             } else {
                                 for (idx, row) in self.data.rows.iter().enumerate() {
                                     let selected = self.data.selected_row == Some(idx);
+                                    
                                     ui.horizontal(|ui| {
-                                        if ui
-                                            .selectable_label(selected, format!("{}", idx + 1))
-                                            .clicked()
-                                        {
+                                        let num_res = ui.add_sized(
+                                            [40.0, 18.0],
+                                            egui::SelectableLabel::new(selected, format!("{}", idx + 1)),
+                                        );
+                                        if num_res.clicked() {
                                             self.data.selected_row = Some(idx);
+                                            self.data.snapshot_img_path = None;
                                         }
-                                        let label =
-                                            ui.selectable_label(selected, &row.amplicon_name);
-                                        if label.clicked() {
+                                        ui.separator();
+                                        
+                                        let name_res = ui.add_sized(
+                                            [400.0, 18.0],
+                                            egui::SelectableLabel::new(selected, &row.amplicon_name),
+                                        );
+                                        if name_res.clicked() {
                                             self.data.selected_row = Some(idx);
+                                            self.data.snapshot_img_path = None;
                                         }
+                                        ui.separator();
+                                        
                                         ui.add_sized(
-                                            [80.0, 18.0],
+                                            [100.0, 18.0],
                                             egui::Label::new(format!("{}", row.count)),
                                         );
+                                        ui.separator();
                                         ui.add_sized(
-                                            [90.0, 18.0],
-                                            egui::Label::new(format!("{}", row.median_length)),
+                                            [110.0, 18.0],
+                                            egui::Label::new(format!("{} bp", row.median_length)),
                                         );
+                                        ui.separator();
                                         ui.add_sized(
-                                            [80.0, 18.0],
+                                            [100.0, 18.0],
                                             egui::Label::new(format!("{:.1}", row.sd_length)),
                                         );
+                                        ui.separator();
                                         ui.add_sized(
-                                            [80.0, 18.0],
+                                            [100.0, 18.0],
                                             egui::Label::new(format!("{:.1}", row.avg_qs)),
                                         );
+                                        ui.separator();
                                         ui.add_sized(
-                                            [80.0, 18.0],
-                                            egui::Label::new(format!("{}", row.variants)),
+                                            [100.0, 18.0],
+                                            egui::Label::new(if row.variants > 0 {
+                                                RichText::new(format!("{} mutations", row.variants))
+                                                    .color(Color32::from_rgb(239, 68, 68))
+                                                    .strong()
+                                            } else {
+                                                RichText::new("0").color(text_color)
+                                            }),
                                         );
                                     });
+                                    ui.separator();
                                 }
                             }
                         });
@@ -1304,7 +1562,7 @@ impl NanoMonitorApp {
             }
             MainTab::Log => {
                 egui::ScrollArea::vertical()
-                    .max_height(340.0)
+                    .max_height(260.0)
                     .show(ui, |ui| {
                         for line in self.log_lines.iter().rev().take(120) {
                             ui.monospace(line);
@@ -1313,127 +1571,441 @@ impl NanoMonitorApp {
             }
         }
 
+        // Row details & manual hooks triggers
         let (sel_amplicons, sel_reads) = self.data.selected_counts();
         ui.separator();
         ui.horizontal(|ui| {
             ui.label(format!(
-                "Selected: {} amplicons, {} reads",
+                "Active selection: {} amplicon(s), {} mapped reads",
                 sel_amplicons, sel_reads
             ));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let _ = ui.add_enabled(false, egui::Button::new("Export Selected"));
+                let has_selection = self.data.selected_row.is_some();
+                
+                // Alignment Snap hook button
+                let btn_snap = ui.add_enabled(
+                    has_selection && !self.snap_running,
+                    egui::Button::new("Generate Region Alignment Snapshot"),
+                );
+                if btn_snap.clicked() {
+                    self.trigger_region_snapshot();
+                }
+                
+                // Variants hook button
+                let btn_vars = ui.add_enabled(
+                    has_selection && !self.variant_calling_running,
+                    egui::Button::new("Call Regional Mutations (rindels)"),
+                );
+                if btn_vars.clicked() {
+                    self.trigger_variant_calling();
+                }
             });
         });
     }
 
+    fn draw_center_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.active_center_sub_tab, 0, "Alignment Snapshot (rs-qc)");
+            ui.selectable_value(&mut self.active_center_sub_tab, 1, "Called Variants Table (rindels)");
+        });
+        ui.separator();
+
+        match self.active_center_sub_tab {
+            0 => {
+                ui.group(|ui| {
+                    ui.label(RichText::new("Genomic Alignment Snap browser representation").strong());
+                    if self.snap_running {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Rendering local alignment region PNG using rs-qc snap...");
+                        });
+                    } else if let Some(img_path) = &self.data.snapshot_img_path {
+                        ui.label(format!("Alignment File location: {}", img_path));
+                        
+                        // Load image using local eframe file provider
+                        egui::ScrollArea::both().show(ui, |ui| {
+                            let img = egui::Image::from_uri(format!("file://{}", img_path))
+                                .fit_to_original_size(1.0)
+                                .max_width(ui.available_width());
+                            ui.add(img);
+                        });
+                    } else {
+                        ui.label(
+                            RichText::new("No alignment snap loaded. Select an amplicon above and click 'Generate Region Alignment Snapshot'.").italics()
+                        );
+                    }
+                });
+            }
+            1 => {
+                ui.group(|ui| {
+                    ui.label(RichText::new("rindels Local Assembly-based Variant Calls").strong());
+                    if self.variant_calling_running {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Calling local insertions, deletions and single nucleotide polymorphisms...");
+                        });
+                    } else if self.data.variants.is_empty() {
+                        ui.label(
+                            RichText::new("No variants called for this region. Select an amplicon above and press 'Call Regional Mutations'.").italics()
+                        );
+                    } else {
+                        egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                            let stroke = Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+                            egui::Frame::default().stroke(stroke).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add_sized([100.0, 18.0], egui::Label::new(RichText::new("Contig").strong()));
+                                    ui.add_sized([110.0, 18.0], egui::Label::new(RichText::new("Position").strong()));
+                                    ui.add_sized([90.0, 18.0], egui::Label::new(RichText::new("Reference").strong()));
+                                    ui.add_sized([90.0, 18.0], egui::Label::new(RichText::new("Mutation").strong()));
+                                    ui.add_sized([90.0, 18.0], egui::Label::new(RichText::new("Depth").strong()));
+                                    ui.add_sized([90.0, 18.0], egui::Label::new(RichText::new("VAF (%)").strong()));
+                                    ui.add_sized([150.0, 18.0], egui::Label::new(RichText::new("ClinVar Annotation").strong()));
+                                    ui.add_sized([220.0, 18.0], egui::Label::new(RichText::new("Classification Verdict").strong()));
+                                    ui.allocate_space(ui.available_size());
+                                });
+                                ui.separator();
+
+                                for var in &self.data.variants {
+                                    ui.horizontal(|ui| {
+                                        ui.add_sized([100.0, 18.0], egui::Label::new(&var.chrom));
+                                        ui.add_sized([110.0, 18.0], egui::Label::new(format!("{}", var.position)));
+                                        ui.add_sized([90.0, 18.0], egui::Label::new(&var.ref_allele));
+                                        ui.add_sized([90.0, 18.0], egui::Label::new(&var.alt_allele));
+                                        ui.add_sized([90.0, 18.0], egui::Label::new(format!("{}", var.depth)));
+                                        ui.add_sized([90.0, 18.0], egui::Label::new(format!("{:.2}%", var.vaf)));
+                                        
+                                        // Highlights ClinVar matching
+                                        let clinvar_color = if var.clinvar != "Unknown / VUS" {
+                                            Color32::from_rgb(239, 68, 68) // Bright red clinical annotation
+                                        } else {
+                                            ui.visuals().widgets.noninteractive.fg_stroke.color
+                                        };
+                                        ui.add_sized([150.0, 18.0], egui::Label::new(
+                                            RichText::new(&var.clinvar).color(clinvar_color).strong()
+                                        ));
+
+                                        // Highlights clinical hot-spots
+                                        let verdict_color = if var.verdict.contains("★ HOTSPOT") {
+                                            Color32::from_rgb(234, 179, 8) // Golden yellow highlights for clinical mutations!
+                                        } else {
+                                            ui.visuals().widgets.noninteractive.fg_stroke.color
+                                        };
+                                        ui.add_sized([220.0, 18.0], egui::Label::new(
+                                            RichText::new(&var.verdict).color(verdict_color).strong()
+                                        ));
+                                        ui.allocate_space(ui.available_size());
+                                    });
+                                }
+                            });
+                        });
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+
     fn draw_bottom_plots(&mut self, ui: &mut egui::Ui) {
+        let (acc_color, qs_color, len_color) = theme_colors(self.active_theme);
+
+        let mut accuracy_hover = None;
+        let mut qs_hover = None;
+        let mut len_hover = None;
+
+        let mut accuracy_hovered = false;
+        let mut qs_hovered = false;
+        let mut len_hovered = false;
+
+        let mut clicked_accuracy = None;
+        let mut clicked_qs = None;
+        let mut clicked_len = None;
+
+        let prev_acc_hovered = self.accuracy_plot_hovered;
+        let prev_qs_hovered = self.qs_plot_hovered;
+        let prev_len_hovered = self.len_plot_hovered;
+
         ui.columns(3, |columns| {
             columns[0].group(|ui| {
-                ui.label(RichText::new("Accuracy Density").strong());
+                ui.label(RichText::new("Sequence Alignment Accuracy Density").strong());
                 if self.data.accuracy_bins.is_empty() {
-                    ui.label(RichText::new("No data").italics());
+                    ui.label(RichText::new("No sequence run data loaded.").italics());
                 } else {
                     ui.label(
-                        RichText::new(format!("Mode: {:.2}", self.data.accuracy_mode))
-                            .color(Color32::from_rgb(180, 40, 40)),
+                        RichText::new(format!("Accuracy Mode: {:.2}%", self.data.accuracy_mode * 100.0))
+                            .color(acc_color)
+                            .strong(),
                     );
                 }
-                let line = Line::new(PlotPoints::from_iter(density_points(
-                    &self.data.accuracy_bins,
-                )));
-                Plot::new("acc_density")
-                    .allow_drag(true)
-                    .allow_zoom(true)
-                    .allow_scroll(true)
-                    .height(220.0)
+                
+                let points = density_points(&self.data.accuracy_bins);
+                let line = Line::new(PlotPoints::from_iter(points));
+                let target_acc = Self::phred_to_accuracy_pct(self.filters.min_qs as f64);
+
+                let plot_response = Plot::new("accuracy_distribution_density")
+                    .allow_drag(false)
+                    .allow_zoom(false)
+                    .allow_scroll(false)
+                    .height(200.0)
                     .show(ui, |plot_ui| {
                         if !self.data.accuracy_bins.is_empty() {
-                            plot_ui.line(line.color(Color32::from_rgb(76, 175, 80)));
+                            plot_ui.line(line.color(acc_color).width(2.0));
+                            
+                            // Draw red vertical line for current threshold
+                            plot_ui.vline(
+                                egui_plot::VLine::new(target_acc)
+                                    .color(Color32::from_rgb(239, 68, 68))
+                                    .style(egui_plot::LineStyle::Dashed { length: 4.0 })
+                            );
+                        }
+
+                        if prev_acc_hovered {
+                            if let Some(coord) = plot_ui.pointer_coordinate() {
+                                accuracy_hover = Some(coord);
+                                // Draw hover crossbar
+                                plot_ui.vline(
+                                    egui_plot::VLine::new(coord.x)
+                                        .color(Color32::GRAY.linear_multiply(0.4))
+                                );
+                            }
                         }
                     });
+
+                accuracy_hovered = plot_response.response.hovered();
+
+                if plot_response.response.clicked() {
+                    if let Some(coord) = accuracy_hover {
+                        clicked_accuracy = Some(coord.x);
+                    }
+                }
             });
 
             columns[1].group(|ui| {
-                ui.label(RichText::new("Q-Score Density").strong());
+                ui.label(RichText::new("Base Quality Q-Score Density").strong());
                 if self.data.qs_bins.is_empty() {
-                    ui.label(RichText::new("No data").italics());
+                    ui.label(RichText::new("No sequence run data loaded.").italics());
                 } else {
                     ui.label(
-                        RichText::new(format!("Mode: {:.2}", self.data.qs_mode))
-                            .color(Color32::from_rgb(180, 40, 40)),
+                        RichText::new(format!("Phred Score Mode: Q{:.1}", self.data.qs_mode))
+                            .color(qs_color)
+                            .strong(),
                     );
                 }
-                let line = Line::new(PlotPoints::from_iter(density_points(&self.data.qs_bins)));
-                Plot::new("qs_density")
-                    .allow_drag(true)
-                    .allow_zoom(true)
-                    .allow_scroll(true)
-                    .height(220.0)
+                
+                let points = density_points(&self.data.qs_bins);
+                let line = Line::new(PlotPoints::from_iter(points));
+                let target_qs = self.filters.min_qs as f64;
+
+                let plot_response = Plot::new("qs_distribution_density")
+                    .allow_drag(false)
+                    .allow_zoom(false)
+                    .allow_scroll(false)
+                    .height(200.0)
                     .show(ui, |plot_ui| {
                         if !self.data.qs_bins.is_empty() {
-                            plot_ui.line(line.color(Color32::from_rgb(30, 136, 229)));
+                            plot_ui.line(line.color(qs_color).width(2.0));
+                            
+                            // Draw red vertical line for current threshold
+                            plot_ui.vline(
+                                egui_plot::VLine::new(target_qs)
+                                    .color(Color32::from_rgb(239, 68, 68))
+                                    .style(egui_plot::LineStyle::Dashed { length: 4.0 })
+                            );
+                        }
+
+                        if prev_qs_hovered {
+                            if let Some(coord) = plot_ui.pointer_coordinate() {
+                                qs_hover = Some(coord);
+                                // Draw hover crossbar
+                                plot_ui.vline(
+                                    egui_plot::VLine::new(coord.x)
+                                        .color(Color32::GRAY.linear_multiply(0.4))
+                                );
+                            }
                         }
                     });
+
+                qs_hovered = plot_response.response.hovered();
+
+                if plot_response.response.clicked() {
+                    if let Some(coord) = qs_hover {
+                        clicked_qs = Some(coord.x);
+                    }
+                }
             });
 
             columns[2].group(|ui| {
-                if self.mode == AnalysisMode::Wgs {
-                    ui.label(RichText::new("CNV (WGS)").strong());
-                    let pts = self
-                        .data
-                        .cnv_bins
-                        .iter()
-                        .map(|p| [p.position_mb, p.log2_ratio])
-                        .collect::<Vec<_>>();
-                    Plot::new("cnv_plot")
-                        .height(220.0)
-                        .allow_drag(true)
-                        .allow_zoom(true)
-                        .allow_scroll(true)
-                        .show(ui, |plot_ui| {
-                            if pts.is_empty() {
-                                // No data loaded yet for WGS.
-                            } else {
-                                plot_ui.points(
-                                    Points::new(pts)
-                                        .radius(1.5)
-                                        .color(Color32::from_rgb(136, 84, 208)),
-                                );
-                            }
-                        });
+                ui.label(RichText::new("Fragment Length Distribution Histogram").strong());
+                if self.data.length_bins.is_empty() {
+                    ui.label(RichText::new("No sequence run data loaded.").italics());
                 } else {
-                    ui.label(RichText::new("Length Histogram").strong());
-                    if self.data.length_bins.is_empty() {
-                        ui.label(RichText::new("No data").italics());
-                    } else {
-                        ui.label(
-                            RichText::new(format!("Median: {:.0}", self.data.length_median))
-                                .color(Color32::from_rgb(230, 140, 0)),
-                        );
-                    }
-                    let bars = self
-                        .data
-                        .length_bins
-                        .iter()
-                        .map(|b| {
-                            let center = (b.start + b.end) * 0.5;
-                            Bar::new(center, b.count as f64).width((b.end - b.start).max(1.0))
-                        })
-                        .collect::<Vec<_>>();
-                    Plot::new("len_hist")
-                        .allow_drag(true)
-                        .allow_zoom(true)
-                        .allow_scroll(true)
-                        .height(220.0)
-                        .show(ui, |plot_ui| {
-                            if !self.data.length_bins.is_empty() {
-                                plot_ui.bar_chart(
-                                    BarChart::new(bars).color(Color32::from_rgb(126, 87, 194)),
+                    ui.label(
+                        RichText::new(format!("Median read length: {:.0} bp", self.data.length_median))
+                            .color(len_color)
+                            .strong(),
+                    );
+                }
+                let bars = self
+                    .data
+                    .length_bins
+                    .iter()
+                    .map(|b| {
+                        let center = (b.start + b.end) * 0.5;
+                        Bar::new(center, b.count as f64).width((b.end - b.start).max(1.0))
+                    })
+                    .collect::<Vec<_>>();
+                let target_len = self.filters.min_len as f64;
+
+                let plot_response = Plot::new("fragment_length_hist")
+                    .allow_drag(false)
+                    .allow_zoom(false)
+                    .allow_scroll(false)
+                    .height(200.0)
+                    .show(ui, |plot_ui| {
+                        if !self.data.length_bins.is_empty() {
+                            plot_ui.bar_chart(
+                                BarChart::new(bars).color(len_color),
+                            );
+                            
+                            // Draw red vertical line for current threshold
+                            plot_ui.vline(
+                                egui_plot::VLine::new(target_len)
+                                    .color(Color32::from_rgb(239, 68, 68))
+                                    .style(egui_plot::LineStyle::Dashed { length: 4.0 })
+                            );
+                        }
+
+                        if prev_len_hovered {
+                            if let Some(coord) = plot_ui.pointer_coordinate() {
+                                len_hover = Some(coord);
+                                // Draw hover crossbar
+                                plot_ui.vline(
+                                    egui_plot::VLine::new(coord.x)
+                                        .color(Color32::GRAY.linear_multiply(0.4))
                                 );
                             }
-                        });
+                        }
+                    });
+
+                len_hovered = plot_response.response.hovered();
+
+                if plot_response.response.clicked() {
+                    if let Some(coord) = len_hover {
+                        clicked_len = Some(coord.x);
+                    }
                 }
             });
+        });
+
+        // Save hovered states for the next frame
+        self.accuracy_plot_hovered = accuracy_hovered;
+        self.qs_plot_hovered = qs_hovered;
+        self.len_plot_hovered = len_hovered;
+
+        // Tooltips on hover
+        if accuracy_hovered {
+            if let Some(coord) = accuracy_hover {
+                let q_equiv = Self::accuracy_pct_to_phred(coord.x);
+                egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), egui::Id::new("acc_plot_tooltip"), |ui| {
+                    ui.label(format!("Accuracy: {:.2}% (equiv. to Q{:.1})", coord.x, q_equiv));
+                    ui.label("Click to set Q-Score filter threshold.");
+                });
+            }
+        }
+        if qs_hovered {
+            if let Some(coord) = qs_hover {
+                let acc_equiv = Self::phred_to_accuracy_pct(coord.x);
+                egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), egui::Id::new("qs_plot_tooltip"), |ui| {
+                    ui.label(format!("Phred Q-Score: Q{:.1} (equiv. to {:.2}% accuracy)", coord.x, acc_equiv));
+                    ui.label("Click to set Q-Score filter threshold.");
+                });
+            }
+        }
+        if len_hovered {
+            if let Some(coord) = len_hover {
+                egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), egui::Id::new("len_plot_tooltip"), |ui| {
+                    ui.label(format!("Read Length: {:.0} bp", coord.x));
+                    ui.label("Click to set minimum length filter.");
+                });
+            }
+        }
+
+        // Apply setting updates from clicks
+        if let Some(x) = clicked_accuracy {
+            let q = Self::accuracy_pct_to_phred(x);
+            self.filters.min_qs = q.clamp(0.0, 40.0) as f32;
+        }
+        if let Some(x) = clicked_qs {
+            self.filters.min_qs = x.clamp(0.0, 40.0) as f32;
+        }
+        if let Some(x) = clicked_len {
+            self.filters.min_len = x.clamp(0.0, 100000.0) as u32;
+        }
+    }
+
+fn phred_to_accuracy_pct(qs: f64) -> f64 {
+    let p_err = 10f64.powf(-qs / 10.0);
+    ((1.0 - p_err) * 100.0).clamp(0.0, 100.0)
+}
+
+fn accuracy_pct_to_phred(acc: f64) -> f64 {
+    let p_err = 1.0 - acc / 100.0;
+    let p_err = p_err.clamp(1e-10, 1.0);
+    -10.0 * p_err.log10()
+}
+
+
+    fn draw_file_ops_panel(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.label(RichText::new("Post-Run Amplicon Extraction & barcode Demultiplexing").strong());
+            
+            ui.label("Export Mapped & Filtered Output Reads:");
+            ui.horizontal(|ui| {
+                ui.text_edit_singleline(&mut self.file_op_output_path);
+                if ui.button("Browse").clicked() {
+                    self.pick_filter_output_file();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Channel Filter range:");
+                ui.text_edit_singleline(&mut self.file_op_channel_range);
+                ui.label(RichText::new("(e.g. 1-128)").small());
+            });
+            ui.horizontal(|ui| {
+                ui.label("Maximum Read Length limit:");
+                ui.add(egui::DragValue::new(&mut self.file_op_max_len).speed(10.0));
+                ui.label("bp (0 = none)");
+            });
+            
+            if ui
+                .add_enabled(!self.file_op_running, egui::Button::new("Filter & Extract Reads"))
+                .clicked()
+            {
+                self.start_filter_export();
+            }
+
+            ui.separator();
+            ui.label("Demultiplex by Barcodes List:");
+            ui.horizontal(|ui| {
+                ui.label("Barcodes file:");
+                ui.text_edit_singleline(&mut self.barcode_file_path);
+                if ui.button("...").clicked() {
+                    self.pick_barcodes_file();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Output Directory:");
+                ui.text_edit_singleline(&mut self.barcode_output_dir);
+                if ui.button("...").clicked() {
+                    self.pick_barcode_output_dir();
+                }
+            });
+            
+            if ui
+                .add_enabled(!self.file_op_running, egui::Button::new("Split Mapped Barcodes"))
+                .clicked()
+            {
+                self.start_barcode_split();
+            }
         });
     }
 }
@@ -1445,27 +2017,55 @@ impl eframe::App for NanoMonitorApp {
             ctx.request_repaint_after(Duration::from_millis(300));
         }
 
-        egui::TopBottomPanel::top("top_panel")
+        // Renders visual theme skin colors on context repaint
+        if !self.theme_applied {
+            apply_theme_visuals(ctx, self.active_theme);
+            self.theme_applied = true;
+        }
+
+        egui::TopBottomPanel::top("header_strip_panel")
             .resizable(false)
             .show(ctx, |ui| self.draw_top_bar(ui));
 
-        egui::SidePanel::left("left_sidebar")
+        egui::SidePanel::left("input_controls_sidebar")
             .resizable(true)
-            .default_width(340.0)
-            .show(ctx, |ui| self.draw_sidebar(ui));
+            .default_width(360.0)
+            .show(ctx, |ui| self.draw_sidebar(ui, ctx));
+
+        egui::TopBottomPanel::bottom("fixed_bottom_plots")
+            .resizable(true)
+            .default_height(280.0)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                self.draw_bottom_plots(ui);
+                ui.add_space(4.0);
+                
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "Total Reads Loaded: {} | Quality Filter Mapped Reads: {}",
+                        format_count(self.data.total_reads),
+                        format_count(self.data.filtered_reads)
+                    ));
+                    
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Extract Demux Options").clicked() {
+                            self.active_center_sub_tab = 0;
+                            self.tab = MainTab::Log;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+            });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             self.draw_filter_strip(ui);
             ui.add_space(8.0);
+            
             self.draw_result_table(ui);
             ui.add_space(8.0);
-            self.draw_bottom_plots(ui);
-            ui.add_space(6.0);
-            ui.label(format!(
-                "Total: {} | Filtered: {}",
-                format_count(self.data.total_reads),
-                format_count(self.data.filtered_reads)
-            ));
+            
+            self.draw_center_panel(ui);
         });
     }
 }
@@ -1473,15 +2073,18 @@ impl eframe::App for NanoMonitorApp {
 impl Drop for NanoMonitorApp {
     fn drop(&mut self) {
         self.stop_directory_watcher();
+        if let Some(stop_tx) = self.remote_stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
     }
 }
 
-fn build_dashboard_from_nanostream(output: AmpliconResult) -> DashboardData {
+fn build_dashboard_from_nanostream(output: &matcher::AmpliconResult) -> DashboardData {
     let mut rows = output
         .amplicons
-        .into_iter()
+        .iter()
         .map(|(name, s)| ResultRow {
-            amplicon_name: name,
+            amplicon_name: name.clone(),
             count: s.count as u32,
             median_length: s.median_length as u32,
             sd_length: s.std_length as f32,
@@ -1491,11 +2094,11 @@ fn build_dashboard_from_nanostream(output: AmpliconResult) -> DashboardData {
         .collect::<Vec<_>>();
     rows.sort_by(|a, b| b.count.cmp(&a.count));
 
-    let d = output.distributions;
+    let d = &output.distributions;
     let (length_bins, qs_bins, accuracy_bins, length_median, qs_mode, accuracy_mode) = (
-        map_bins(d.length_bins),
-        map_bins(d.qs_bins),
-        map_bins(d.accuracy_bins),
+        map_bins(&d.length_bins),
+        map_bins(&d.qs_bins),
+        map_bins(&d.accuracy_bins),
         d.length_median,
         d.qs_mode,
         d.accuracy_mode,
@@ -1508,18 +2111,20 @@ fn build_dashboard_from_nanostream(output: AmpliconResult) -> DashboardData {
         selected_row: None,
         total_reads: output.total_reads as u64,
         filtered_reads: filtered_reads as u64,
-        cnv_bins: Vec::new(),
         length_bins,
         qs_bins,
         accuracy_bins,
         length_median,
         qs_mode,
         accuracy_mode,
+        accumulated_files: 1,
+        variants: Vec::new(),
+        snapshot_img_path: None,
     }
 }
 
-fn map_bins(bins: Vec<matcher::DistributionBin>) -> Vec<HistogramBin> {
-    bins.into_iter()
+fn map_bins(bins: &[matcher::DistributionBin]) -> Vec<HistogramBin> {
+    bins.iter()
         .map(|b| HistogramBin {
             start: b.start,
             end: b.end,
@@ -1554,4 +2159,118 @@ fn format_count(value: u64) -> String {
         out.push(ch);
     }
     out.chars().rev().collect()
+}
+
+/// Applies visuals colors and layouts dynamically for customizable UI theme skins
+fn apply_theme_visuals(ctx: &egui::Context, theme: ThemeSkin) {
+    let mut visuals = match theme {
+        ThemeSkin::Solarized | ThemeSkin::ClassicLight => egui::Visuals::light(),
+        _ => egui::Visuals::dark(),
+    };
+
+    match theme {
+        ThemeSkin::BioTeal => {
+            // Obsidian Charcoal + Biotech Teal
+            visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(18, 18, 20);
+            visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(33, 33, 38));
+            visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(205, 205, 210));
+            
+            visuals.widgets.inactive.bg_fill = Color32::from_rgb(26, 26, 32);
+            visuals.widgets.hovered.bg_fill = Color32::from_rgb(38, 38, 46);
+            visuals.widgets.hovered.fg_stroke = Stroke::new(1.2, Color32::from_rgb(45, 212, 191));
+            
+            visuals.widgets.active.bg_fill = Color32::from_rgb(13, 148, 136);
+            visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+            visuals.selection.bg_fill = Color32::from_rgb(13, 148, 136);
+        }
+        ThemeSkin::Matrix => {
+            // Pure Console Black + Terminal Lime Green
+            visuals.widgets.noninteractive.bg_fill = Color32::BLACK;
+            visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.5, Color32::from_rgb(0, 180, 0));
+            visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(0, 255, 0));
+            
+            visuals.widgets.inactive.bg_fill = Color32::from_rgb(12, 12, 12);
+            visuals.widgets.hovered.bg_fill = Color32::from_rgb(25, 25, 25);
+            visuals.widgets.hovered.fg_stroke = Stroke::new(1.5, Color32::from_rgb(50, 255, 50));
+            
+            visuals.widgets.active.bg_fill = Color32::from_rgb(0, 150, 0);
+            visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::BLACK);
+            visuals.selection.bg_fill = Color32::from_rgb(0, 100, 0);
+        }
+        ThemeSkin::Cyberpunk => {
+            // Deep purple space + glowing pink neon
+            visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(16, 12, 30);
+            visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(244, 63, 94));
+            visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(254, 240, 138));
+            
+            visuals.widgets.inactive.bg_fill = Color32::from_rgb(24, 18, 44);
+            visuals.widgets.hovered.bg_fill = Color32::from_rgb(38, 28, 68);
+            visuals.widgets.hovered.fg_stroke = Stroke::new(1.2, Color32::from_rgb(236, 72, 153));
+            
+            visuals.widgets.active.bg_fill = Color32::from_rgb(244, 63, 94);
+            visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+            visuals.selection.bg_fill = Color32::from_rgb(244, 63, 94);
+        }
+        ThemeSkin::Solarized => {
+            // Solarized Light Cream + amber details
+            visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(253, 246, 227);
+            visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(238, 232, 213));
+            visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(88, 110, 117));
+            
+            visuals.widgets.inactive.bg_fill = Color32::from_rgb(238, 232, 213);
+            visuals.widgets.hovered.bg_fill = Color32::from_rgb(220, 214, 195);
+            visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::from_rgb(38, 139, 210));
+            
+            visuals.widgets.active.bg_fill = Color32::from_rgb(181, 137, 0);
+            visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+            visuals.selection.bg_fill = Color32::from_rgb(181, 137, 0);
+        }
+        ThemeSkin::ClassicLight => {
+            // Clean Gray + Royal Slate Blue
+            visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(245, 245, 248);
+            visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(218, 218, 224));
+            visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(45, 45, 48));
+            
+            visuals.widgets.inactive.bg_fill = Color32::from_rgb(232, 232, 238);
+            visuals.widgets.hovered.bg_fill = Color32::from_rgb(220, 220, 228);
+            visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::from_rgb(37, 99, 235));
+            
+            visuals.widgets.active.bg_fill = Color32::from_rgb(37, 99, 235);
+            visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+            visuals.selection.bg_fill = Color32::from_rgb(37, 99, 235);
+        }
+    }
+
+    ctx.set_visuals(visuals);
+}
+
+/// Dynamic plot theme color resolver
+fn theme_colors(theme: ThemeSkin) -> (Color32, Color32, Color32) {
+    match theme {
+        ThemeSkin::BioTeal => (
+            Color32::from_rgb(45, 212, 191), // Teal
+            Color32::from_rgb(59, 130, 246), // Blue
+            Color32::from_rgb(139, 92, 246), // Purple
+        ),
+        ThemeSkin::Matrix => (
+            Color32::from_rgb(0, 255, 0),     // Green
+            Color32::from_rgb(0, 180, 0),     // Medium Green
+            Color32::from_rgb(50, 255, 50),   // Light Green
+        ),
+        ThemeSkin::Cyberpunk => (
+            Color32::from_rgb(244, 63, 94),   // Pink
+            Color32::from_rgb(6, 182, 212),   // Cyan
+            Color32::from_rgb(250, 204, 21),  // Yellow
+        ),
+        ThemeSkin::Solarized => (
+            Color32::from_rgb(42, 161, 152),  // Cyan
+            Color32::from_rgb(38, 139, 210),  // Blue
+            Color32::from_rgb(203, 75, 22),   // Orange
+        ),
+        ThemeSkin::ClassicLight => (
+            Color32::from_rgb(76, 175, 80),   // Green
+            Color32::from_rgb(33, 150, 243),  // Blue
+            Color32::from_rgb(156, 39, 176),  // Purple
+        ),
+    }
 }
