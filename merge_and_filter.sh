@@ -108,6 +108,10 @@ if [ ! -f "$PRIMERS" ]; then
     exit 1
 fi
 
+# Get absolute paths to handle pruning correctly
+ABS_FASTQ_PASS=$(cd "$FASTQ_PASS" && pwd)
+ABS_OUTPUT_DIR=$(mkdir -p "$OUTPUT_DIR" && cd "$OUTPUT_DIR" && pwd)
+
 # Create directories
 MERGED_DIR="$OUTPUT_DIR/merged"
 mkdir -p "$MERGED_DIR"
@@ -145,19 +149,29 @@ while IFS=$'\t' read -r run_id sample_id barcode || [ -n "$run_id" ]; do
     
     # 1. Check run_id/barcode subfolder
     if [ -d "$FASTQ_PASS/$run_id/$barcode" ]; then
+        ABS_SUBDIR=$(cd "$FASTQ_PASS/$run_id/$barcode" && pwd)
         while IFS= read -r -d '' file; do
             FILES+=("$file")
-        done < <(find "$FASTQ_PASS/$run_id/$barcode" -type f \( -name "*.fastq" -o -name "*.fastq.gz" -o -name "*.fq" -o -name "*.fq.gz" \) -print0)
+        done < <(find "$ABS_SUBDIR" -path "$ABS_OUTPUT_DIR*" -prune -o -type f \( -name "*.fastq" -o -name "*.fastq.gz" -o -name "*.fq" -o -name "*.fq.gz" \) -print0)
     # 2. Check barcode subfolder directly
     elif [ -d "$FASTQ_PASS/$barcode" ]; then
+        ABS_SUBDIR=$(cd "$FASTQ_PASS/$barcode" && pwd)
         while IFS= read -r -d '' file; do
             FILES+=("$file")
-        done < <(find "$FASTQ_PASS/$barcode" -type f \( -name "*.fastq" -o -name "*.fastq.gz" -o -name "*.fq" -o -name "*.fq.gz" \) -print0)
-    # 3. Scan directory for matching names
+        done < <(find "$ABS_SUBDIR" -path "$ABS_OUTPUT_DIR*" -prune -o -type f \( -name "*.fastq" -o -name "*.fastq.gz" -o -name "*.fq" -o -name "*.fq.gz" \) -print0)
+    # 3. Scan directory for matching names with exact delimiting
     else
         while IFS= read -r -d '' file; do
             FILES+=("$file")
-        done < <(find "$FASTQ_PASS" -type f \( -name "*${barcode}*.fastq" -o -name "*${barcode}*.fastq.gz" -o -name "*${barcode}*.fq" -o -name "*${barcode}*.fq.gz" \) -print0)
+        done < <(find "$ABS_FASTQ_PASS" -path "$ABS_OUTPUT_DIR*" -prune -o -type f \( \
+            -name "${barcode}.fastq" -o -name "${barcode}.fastq.gz" -o \
+            -name "${barcode}.fq" -o -name "${barcode}.fq.gz" -o \
+            -name "${barcode}_*.fastq" -o -name "${barcode}_*.fastq.gz" -o \
+            -name "${barcode}_*.fq" -o -name "${barcode}_*.fq.gz" -o \
+            -name "*_${barcode}.fastq" -o -name "*_${barcode}.fastq.gz" -o \
+            -name "*_${barcode}.fq" -o -name "*_${barcode}.fq.gz" -o \
+            -name "*_${barcode}_*.fastq" -o -name "*_${barcode}_*.fastq.gz" -o \
+            -name "*_${barcode}_*.fq" -o -name "*_${barcode}_*.fq.gz" \) -print0)
     fi
 
     if [ ${#FILES[@]} -eq 0 ]; then

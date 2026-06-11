@@ -24,6 +24,15 @@ use crate::primers::{load_primers, KmerIndex, Primer};
 use crate::qv::qv_from_record;
 use crate::MatchMode;
 
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct PrimerMatchingStats {
+    pub start_matches: usize,
+    pub end_matches: usize,
+    pub total_matches: usize,
+    pub total_edit_distance: usize,
+    pub avg_edit_distance: f32,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AmpliconResult {
     pub amplicons: HashMap<String, AmpliconStats>,
@@ -32,6 +41,12 @@ pub struct AmpliconResult {
     pub total_reads: usize,
     pub rescued_count: usize,
     pub distributions: ReadDistributions,
+    pub total_raw_reads: usize,
+    pub failed_len_filter: usize,
+    pub failed_qs_filter: usize,
+    pub failed_primer_match: usize,
+    pub failed_pair_match: usize,
+    pub primer_matching_stats: HashMap<String, PrimerMatchingStats>,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,6 +113,8 @@ struct MatchResult {
     amplicon_name: Option<String>,
     start_primer: Option<String>, // For debug stats
     end_primer: Option<String>,   // For debug stats
+    start_dist: u32,
+    end_dist: u32,
     is_chimera: bool,
     length: usize,
     quality: f32,
@@ -257,6 +274,8 @@ fn match_read_sequence(
                         amplicon_name: Some(s.to_string()),
                         start_primer: Some(s.to_string()),
                         end_primer: Some(e.to_string()), // Same name
+                        start_dist: 0,
+                        end_dist: 0,
                         length: length,
                         quality,
                         chrom: chrom.clone(),
@@ -279,6 +298,8 @@ fn match_read_sequence(
                         amplicon_name: Some(name),
                         start_primer: Some(s.to_string()),
                         end_primer: Some(e.to_string()),
+                        start_dist: 0,
+                        end_dist: 0,
                         length: length,
                         quality,
                         chrom: chrom.clone(),
@@ -424,6 +445,8 @@ fn match_read_sequence(
         amplicon_name,
         start_primer: best_start_primer.map(|s| s.to_string()),
         end_primer: best_end_primer.map(|s| s.to_string()),
+        start_dist: best_start_dist,
+        end_dist: best_end_dist,
         is_chimera,
         length,
         quality,
@@ -444,6 +467,8 @@ fn match_read_coords(record: &bam::Record, index: usize) -> MatchResult {
             amplicon_name: None,
             start_primer: None,
             end_primer: None,
+            start_dist: 0,
+            end_dist: 0,
             is_chimera: false,
             length,
             quality,
@@ -465,6 +490,8 @@ fn match_read_coords(record: &bam::Record, index: usize) -> MatchResult {
         amplicon_name,
         start_primer: None,
         end_primer: None,
+        start_dist: 0,
+        end_dist: 0,
         is_chimera: false,
         length,
         quality,
@@ -587,6 +614,8 @@ fn match_fastq_read(
         amplicon_name,
         start_primer: best_start_primer.map(|s| s.to_string()),
         end_primer: best_end_primer.map(|s| s.to_string()),
+        start_dist: best_start_dist,
+        end_dist: best_end_dist,
         is_chimera,
         length,
         quality,
@@ -867,7 +896,13 @@ where
         let mut unmatched_count = 0usize;
         let mut dist_lengths = Vec::<f64>::new();
         let mut dist_qs = Vec::<f64>::new();
-        let mut total_reads = 0;
+        let mut total_reads = 0usize;
+        let mut total_raw_reads = 0usize;
+        let mut failed_len_filter = 0usize;
+        let mut failed_qs_filter = 0usize;
+        let mut failed_primer_match = 0usize;
+        let mut failed_pair_match = 0usize;
+        let mut primer_matching_stats: HashMap<String, PrimerMatchingStats> = HashMap::new();
 
         loop {
             let mut chunk = Vec::new();
@@ -905,6 +940,7 @@ where
                     break;
                 }
                 let qual = line.clone();
+                total_raw_reads += 1;
 
                 let seq_trim = trim_line_ending(&seq);
                 let qual_trim = trim_line_ending(&qual);
@@ -914,6 +950,7 @@ where
 
                 let len = seq_trim.len();
                 if len < len_range.0 || len > len_range.1 {
+                    failed_len_filter += 1;
                     continue;
                 }
 
@@ -956,6 +993,20 @@ where
                 .collect();
 
             for mut res in chunk_results {
+                // Record primer matching stats before filtering
+                if let Some(p) = &res.start_primer {
+                    let stats = primer_matching_stats.entry(p.clone()).or_default();
+                    stats.start_matches += 1;
+                    stats.total_matches += 1;
+                    stats.total_edit_distance += res.start_dist as usize;
+                }
+                if let Some(p) = &res.end_primer {
+                    let stats = primer_matching_stats.entry(p.clone()).or_default();
+                    stats.end_matches += 1;
+                    stats.total_matches += 1;
+                    stats.total_edit_distance += res.end_dist as usize;
+                }
+
                 total_reads += 1;
                 if res.is_chimera {
                     chimera_count += 1;
@@ -976,6 +1027,7 @@ where
                     };
 
                     if qs < min_qs {
+                        failed_qs_filter += 1;
                         unmatched_count += 1;
                         continue;
                     }
@@ -991,42 +1043,44 @@ where
                     };
 
                     if is_valid {
-                        let stats = amplicons.entry(name.clone()).or_default();
-                        stats.count += 1;
-                        stats.lengths.push(res.length);
-                        stats.qualities.push(res.quality);
-                        stats.read_ids.push(r.id.clone());
+                         let stats = amplicons.entry(name.clone()).or_default();
+                         stats.count += 1;
+                         stats.lengths.push(res.length);
+                         stats.qualities.push(res.quality);
+                         stats.read_ids.push(r.id.clone());
 
-                        if let Some(ref out_path) = output_fastq {
-                            let writer = if split_by_amplicon {
-                                let path = get_split_path(out_path, name);
-                                writers.entry(name.clone()).or_insert_with(|| {
-                                    create_fastq_writer(&path).expect("Failed to create split FASTQ writer")
-                                })
-                            } else {
-                                main_fq_writer.as_mut().unwrap()
-                            };
-                            writer.write_all(b"@")?;
-                            writer.write_all(r.id.as_bytes())?;
-                            writer.write_all(b"\n")?;
-                            writer.write_all(&r.seq)?;
-                            writer.write_all(b"\n+\n")?;
-                            writer.write_all(&r.qual)?;
-                            writer.write_all(b"\n")?;
-                        }
+                         if let Some(ref out_path) = output_fastq {
+                             let writer = if split_by_amplicon {
+                                 let path = get_split_path(out_path, name);
+                                 writers.entry(name.clone()).or_insert_with(|| {
+                                     create_fastq_writer(&path).expect("Failed to create split FASTQ writer")
+                                 })
+                             } else {
+                                 main_fq_writer.as_mut().unwrap()
+                             };
+                             writer.write_all(b"@")?;
+                             writer.write_all(r.id.as_bytes())?;
+                             writer.write_all(b"\n")?;
+                             writer.write_all(&r.seq)?;
+                             writer.write_all(b"\n+\n")?;
+                             writer.write_all(&r.qual)?;
+                             writer.write_all(b"\n")?;
+                         }
                     } else {
-                        unmatched_count += 1;
-                        if let Some(ref mut writer) = dimers_fq_writer {
-                            writer.write_all(b"@")?;
-                            writer.write_all(r.id.as_bytes())?;
-                            writer.write_all(b"\n")?;
-                            writer.write_all(&r.seq)?;
-                            writer.write_all(b"\n+\n")?;
-                            writer.write_all(&r.qual)?;
-                            writer.write_all(b"\n")?;
-                        }
+                         failed_pair_match += 1;
+                         unmatched_count += 1;
+                         if let Some(ref mut writer) = dimers_fq_writer {
+                             writer.write_all(b"@")?;
+                             writer.write_all(r.id.as_bytes())?;
+                             writer.write_all(b"\n")?;
+                             writer.write_all(&r.seq)?;
+                             writer.write_all(b"\n+\n")?;
+                             writer.write_all(&r.qual)?;
+                             writer.write_all(b"\n")?;
+                         }
                     }
                 } else {
+                    failed_primer_match += 1;
                     unmatched_count += 1;
                 }
             }
@@ -1042,6 +1096,12 @@ where
                 total_reads,
                 rescued_count: 0,
                 distributions: build_distributions_from_values(&dist_lengths, &dist_qs),
+                total_raw_reads,
+                failed_len_filter,
+                failed_qs_filter,
+                failed_primer_match,
+                failed_pair_match,
+                primer_matching_stats: primer_matching_stats.clone(),
             };
             progress_callback(&intermediate);
 
@@ -1054,6 +1114,12 @@ where
             stats.finalize();
         }
 
+        for stats in primer_matching_stats.values_mut() {
+            if stats.total_matches > 0 {
+                stats.avg_edit_distance = stats.total_edit_distance as f32 / stats.total_matches as f32;
+            }
+        }
+
         let result = AmpliconResult {
             amplicons,
             chimera_count,
@@ -1061,24 +1127,66 @@ where
             total_reads,
             rescued_count: 0,
             distributions: build_distributions_from_values(&dist_lengths, &dist_qs),
+            total_raw_reads,
+            failed_len_filter,
+            failed_qs_filter,
+            failed_primer_match,
+            failed_pair_match,
+            primer_matching_stats,
         };
 
         if print_summary {
             eprintln!("\n=== nanoparse Summary ===");
-            eprintln!("Total reads:    {:>8}", result.total_reads);
+            eprintln!("Total raw reads:        {:>8}", result.total_raw_reads);
+            eprintln!(
+                "Filtered by length:     {:>8} ({:.1}%)",
+                result.failed_len_filter,
+                result.failed_len_filter as f64 / result.total_raw_reads.max(1) as f64 * 100.0
+            );
+            eprintln!(
+                "Filtered by quality:    {:>8} ({:.1}%)",
+                result.failed_qs_filter,
+                result.failed_qs_filter as f64 / result.total_raw_reads.max(1) as f64 * 100.0
+            );
+            eprintln!(
+                "Failed primer match:    {:>8} ({:.1}%)",
+                result.failed_primer_match,
+                result.failed_primer_match as f64 / result.total_raw_reads.max(1) as f64 * 100.0
+            );
+
             let total_matched = result.total_reads.saturating_sub(result.unmatched_count);
-            let denom = result.total_reads.max(1) as f64;
             eprintln!(
-                "Matched:        {:>8} ({:.1}%)",
+                "Matched amplicons:      {:>8} ({:.1}%)",
                 total_matched,
-                total_matched as f64 / denom * 100.0
+                total_matched as f64 / result.total_raw_reads.max(1) as f64 * 100.0
             );
             eprintln!(
-                "Unmatched:      {:>8} ({:.1}%)",
-                result.unmatched_count,
-                result.unmatched_count as f64 / denom * 100.0
+                "  - Valid Fwd-Rev:      {:>8} ({:.1}%)",
+                total_matched,
+                total_matched as f64 / result.total_reads.max(1) as f64 * 100.0
             );
-            eprintln!("Amplicon types: {:>8}", result.amplicons.len());
+            eprintln!(
+                "  - Dimers/Invalid:     {:>8} ({:.1}%)",
+                result.failed_pair_match,
+                result.failed_pair_match as f64 / result.total_reads.max(1) as f64 * 100.0
+            );
+            eprintln!("Amplicon types:         {:>8}", result.amplicons.len());
+
+            if !result.primer_matching_stats.is_empty() {
+                eprintln!("\n=== Primer Matching Details ===");
+                eprintln!("{:<25} | {:>14} | {:>14} | {:>16}", "Primer Name", "Start Matches", "End Matches", "Avg Mismatches");
+                eprintln!("{}", "-".repeat(78));
+                let mut sorted_primers: Vec<_> = result.primer_matching_stats.keys().collect();
+                sorted_primers.sort();
+                for name in sorted_primers {
+                    let s = &result.primer_matching_stats[name];
+                    eprintln!(
+                        "{:<25} | {:>14} | {:>14} | {:>16.2}",
+                        name, s.start_matches, s.end_matches, s.avg_edit_distance
+                    );
+                }
+            }
+            eprintln!("=========================\n");
         }
 
         return Ok(result);
@@ -1104,9 +1212,16 @@ where
     let mut amplicon_coords: HashMap<String, (String, Vec<i64>, Vec<i64>)> = HashMap::new();
     let mut dist_lengths = Vec::<f64>::new();
     let mut dist_qs = Vec::<f64>::new();
+    let mut total_raw_reads = 0usize;
+    let mut failed_len_filter = 0usize;
+    let mut failed_qs_filter = 0usize;
+    let mut failed_primer_match = 0usize;
+    let mut failed_pair_match = 0usize;
+    let mut primer_matching_stats: HashMap<String, PrimerMatchingStats> = HashMap::new();
 
     for result in bam.records() {
         let record = result?;
+        total_raw_reads += 1;
         total_seen += 1;
 
         if max_reads > 0 && total_processed >= max_reads {
@@ -1114,10 +1229,12 @@ where
         }
         let seq_len = record.seq_len();
         if seq_len < len_range.0 || seq_len > len_range.1 {
+            failed_len_filter += 1;
             continue;
         }
         let qs = qv_from_record(&record);
         if qs < min_qs {
+            failed_qs_filter += 1;
             continue;
         }
         if duplex_only {
@@ -1152,6 +1269,20 @@ where
             )
         };
 
+        // Record primer matching stats for BAM
+        if let Some(p) = &res.start_primer {
+            let stats = primer_matching_stats.entry(p.clone()).or_default();
+            stats.start_matches += 1;
+            stats.total_matches += 1;
+            stats.total_edit_distance += res.start_dist as usize;
+        }
+        if let Some(p) = &res.end_primer {
+            let stats = primer_matching_stats.entry(p.clone()).or_default();
+            stats.end_matches += 1;
+            stats.total_matches += 1;
+            stats.total_edit_distance += res.end_dist as usize;
+        }
+
         total_processed += 1;
         dist_lengths.push(res.length as f64);
         dist_qs.push(res.quality as f64);
@@ -1167,23 +1298,35 @@ where
         }
 
         if let Some(name) = &res.amplicon_name {
-            let stats = amplicons.entry(name.clone()).or_default();
-            stats.count += 1;
-            stats.lengths.push(res.length);
-            stats.qualities.push(res.quality);
-            stats.read_ids.push(read_id);
+            let is_valid = if let (Some(p1), Some(p2)) = (&res.start_primer, &res.end_primer) {
+                is_fwd_rev_pair(p1, p2)
+            } else {
+                true // In coordinate mode, assume valid coord match
+            };
 
-            if let (Some(c), Some(s), Some(e)) = (&res.chrom, res.start, res.end) {
-                if stats.chrom.is_none() {
-                    stats.chrom = Some(c.clone());
+            if is_valid {
+                let stats = amplicons.entry(name.clone()).or_default();
+                stats.count += 1;
+                stats.lengths.push(res.length);
+                stats.qualities.push(res.quality);
+                stats.read_ids.push(read_id);
+
+                if let (Some(c), Some(s), Some(e)) = (&res.chrom, res.start, res.end) {
+                    if stats.chrom.is_none() {
+                        stats.chrom = Some(c.clone());
+                    }
+                    let entry = amplicon_coords
+                        .entry(name.clone())
+                        .or_insert_with(|| (c.clone(), Vec::new(), Vec::new()));
+                    entry.1.push(s);
+                    entry.2.push(e);
                 }
-                let entry = amplicon_coords
-                    .entry(name.clone())
-                    .or_insert_with(|| (c.clone(), Vec::new(), Vec::new()));
-                entry.1.push(s);
-                entry.2.push(e);
+            } else {
+                failed_pair_match += 1;
+                unassigned_results.push(PendingUnassigned { id: read_id, res });
             }
         } else {
+            failed_primer_match += 1;
             unassigned_results.push(PendingUnassigned { id: read_id, res });
         }
 
@@ -1199,6 +1342,12 @@ where
                 total_reads: total_processed,
                 rescued_count: 0,
                 distributions: build_distributions_from_values(&dist_lengths, &dist_qs),
+                total_raw_reads,
+                failed_len_filter,
+                failed_qs_filter,
+                failed_primer_match,
+                failed_pair_match,
+                primer_matching_stats: primer_matching_stats.clone(),
             };
             progress_callback(&intermediate);
         }
@@ -1302,6 +1451,12 @@ where
 
     let distributions = build_distributions_from_values(&dist_lengths, &dist_qs);
 
+    for stats in primer_matching_stats.values_mut() {
+        if stats.total_matches > 0 {
+            stats.avg_edit_distance = stats.total_edit_distance as f32 / stats.total_matches as f32;
+        }
+    }
+
     let result = AmpliconResult {
         amplicons,
         chimera_count,
@@ -1309,52 +1464,69 @@ where
         total_reads: total_processed,
         rescued_count,
         distributions,
+        total_raw_reads,
+        failed_len_filter,
+        failed_qs_filter,
+        failed_primer_match,
+        failed_pair_match,
+        primer_matching_stats,
     };
 
     if print_summary {
         eprintln!("\n=== nanoparse Summary ===");
-        eprintln!("Total reads:    {:>8}", result.total_reads);
-
-        let total_matched = result.total_reads - result.unmatched_count;
-        let direct_matched = total_matched - rescued_count;
-
-        let denom = result.total_reads.max(1) as f64;
+        eprintln!("Total raw reads:        {:>8}", result.total_raw_reads);
         eprintln!(
-            "Matched:        {:>8} ({:.1}%)",
+            "Filtered by length:     {:>8} ({:.1}%)",
+            result.failed_len_filter,
+            result.failed_len_filter as f64 / result.total_raw_reads.max(1) as f64 * 100.0
+        );
+        eprintln!(
+            "Filtered by quality:    {:>8} ({:.1}%)",
+            result.failed_qs_filter,
+            result.failed_qs_filter as f64 / result.total_raw_reads.max(1) as f64 * 100.0
+        );
+        eprintln!(
+            "Failed primer match:    {:>8} ({:.1}%)",
+            result.failed_primer_match,
+            result.failed_primer_match as f64 / result.total_raw_reads.max(1) as f64 * 100.0
+        );
+
+        let total_matched = result.total_reads.saturating_sub(result.unmatched_count);
+        let direct_matched = total_matched.saturating_sub(rescued_count);
+        eprintln!(
+            "Matched amplicons:      {:>8} ({:.1}%)",
             total_matched,
-            total_matched as f64 / denom * 100.0
+            total_matched as f64 / result.total_raw_reads.max(1) as f64 * 100.0
         );
         eprintln!(
-            "  Direct:       {:>8} ({:.1}%)",
+            "  - Direct:             {:>8} ({:.1}%)",
             direct_matched,
-            direct_matched as f64 / denom * 100.0
+            direct_matched as f64 / result.total_raw_reads.max(1) as f64 * 100.0
         );
         eprintln!(
-            "  Rescued:      {:>8} ({:.1}%)",
+            "  - Rescued:            {:>8} ({:.1}%)",
             rescued_count,
-            rescued_count as f64 / denom * 100.0
+            rescued_count as f64 / result.total_raw_reads.max(1) as f64 * 100.0
         );
-
         eprintln!(
-            "Unmatched:      {:>8} ({:.1}%)",
-            result.unmatched_count,
-            result.unmatched_count as f64 / denom * 100.0
+            "  - Dimers/Invalid:     {:>8} ({:.1}%)",
+            result.failed_pair_match,
+            result.failed_pair_match as f64 / result.total_raw_reads.max(1) as f64 * 100.0
         );
-        eprintln!("Amplicon types: {:>8}", result.amplicons.len());
+        eprintln!("Amplicon types:         {:>8}", result.amplicons.len());
 
-        // Primer counts table (include ALL primers)
-        let mut sorted_primers: Vec<_> = primers
-            .iter()
-            .map(|p| (p.name.as_str(), *primer_counts.get(&p.name).unwrap_or(&0)))
-            .collect();
-        sorted_primers.sort_by(|a, b| b.1.cmp(&a.1));
-
-        if !sorted_primers.is_empty() {
-            eprintln!("\nPrimer Hit Counts (Any hit):");
-            eprintln!("{:<40} | {:>8}", "Primer Name", "Hits");
-            eprintln!("{}", "-".repeat(51));
-            for (name, count) in sorted_primers {
-                eprintln!("{:<40} | {:>8}", name, count);
+        if !result.primer_matching_stats.is_empty() {
+            eprintln!("\n=== Primer Matching Details ===");
+            eprintln!("{:<25} | {:>14} | {:>14} | {:>16}", "Primer Name", "Start Matches", "End Matches", "Avg Mismatches");
+            eprintln!("{}", "-".repeat(78));
+            let mut sorted_primers: Vec<_> = result.primer_matching_stats.keys().collect();
+            sorted_primers.sort();
+            for name in sorted_primers {
+                let s = &result.primer_matching_stats[name];
+                eprintln!(
+                    "{:<25} | {:>14} | {:>14} | {:>16.2}",
+                    name, s.start_matches, s.end_matches, s.avg_edit_distance
+                );
             }
         }
 
