@@ -45,6 +45,7 @@ fn main() -> Result<()> {
             output_fastq,
             output_dimers,
             split_by_amplicon,
+            split_chimeras,
         } => {
             let len_range = if len.is_empty() {
                 (0, usize::MAX)
@@ -78,8 +79,10 @@ fn main() -> Result<()> {
                 output_fastq.as_deref(),
                 output_dimers.as_deref(),
                 split_by_amplicon,
+                split_chimeras,
             )?;
         }
+
         cli::Commands::PoreStats {
             input,
             sequencing_summary,

@@ -14,7 +14,8 @@ use nanoseq_core::quality::mean_qv_from_fastq_ascii;
 use rayon::prelude::*;
 use rust_htslib::bam::{self, record::Aux, Read};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use triple_accel::levenshtein::levenshtein_simd_k;
@@ -47,7 +48,10 @@ pub struct AmpliconResult {
     pub failed_primer_match: usize,
     pub failed_pair_match: usize,
     pub primer_matching_stats: HashMap<String, PrimerMatchingStats>,
+    #[serde(default)]
+    pub split_chimeras_count: usize,
 }
+
 
 #[derive(Debug, Serialize)]
 pub struct ReadDistributions {
@@ -173,7 +177,136 @@ fn semi_global_align(pattern: &[u8], text: &[u8], max_dist: usize) -> Option<u32
     best_dist
 }
 
+/// Semi-global alignment returning the start index in `text` and edit distance
+fn semi_global_align_find(pattern: &[u8], text: &[u8], max_dist: usize) -> Option<(usize, u32)> {
+    if pattern.is_empty() || text.is_empty() {
+        return None;
+    }
+
+    let pattern_len = pattern.len();
+    let mut best: Option<(usize, u32)> = None;
+
+    let max_start = if text.len() > pattern_len {
+        text.len() - pattern_len + max_dist
+    } else {
+        max_dist
+    };
+
+    for start in 0..=max_start.min(text.len().saturating_sub(1)) {
+        for d in -(max_dist as isize)..=(max_dist as isize) {
+            let target_len = (pattern_len as isize + d) as usize;
+            if target_len == 0 || start + target_len > text.len() {
+                continue;
+            }
+            let text_slice = &text[start..start + target_len];
+            if let Some(dist) = levenshtein_simd_k(pattern, text_slice, max_dist as u32) {
+                if dist == 0 {
+                    return Some((start, 0)); // Perfect match - early exit
+                }
+                if best.is_none() || dist < best.unwrap().1 {
+                    best = Some((start, dist));
+                }
+            }
+        }
+    }
+
+    best
+
+}
+
+/// Split a concatemeric/chimeric FASTQ read into multiple sub-reads by finding internal primers.
+/// Returns a Vec containing the original read (if no internal primer found) or the split sub-reads.
+fn split_chimera_fastq_read(
+    read: FastqRead,
+    primers: &[Primer],
+    end_length: usize,
+    max_edit_dist: usize,
+) -> Vec<FastqRead> {
+    let mut results = Vec::new();
+    let base_id = read.id.clone();
+    let mut queue = VecDeque::new();
+    queue.push_back(read);
+    let mut split_count = 0usize;
+
+    while let Some(current) = queue.pop_front() {
+        let len = current.seq.len();
+        let min_subread_len = end_length.max(150);
+        if len < min_subread_len * 2 {
+            results.push(current);
+            continue;
+        }
+
+        let search_start = min_subread_len;
+        let search_end = len.saturating_sub(min_subread_len);
+        if search_end <= search_start {
+            results.push(current);
+            continue;
+        }
+
+        let middle = &current.seq[search_start..search_end];
+        let mut best_cut: Option<(usize, u32)> = None; // (cut_pos, edit_dist)
+
+        for primer in primers {
+            // Forward orientation: primer starts the following amplicon
+            let p_bytes = primer.sequence.as_bytes();
+            if let Some((offset, dist)) = semi_global_align_find(p_bytes, middle, max_edit_dist) {
+                let cut_pos = search_start + offset;
+                if cut_pos >= min_subread_len && len - cut_pos >= min_subread_len {
+                    if best_cut.is_none()
+                        || cut_pos < best_cut.unwrap().0.saturating_sub(50)
+                        || (cut_pos <= best_cut.unwrap().0 + 50 && dist < best_cut.unwrap().1)
+                    {
+                        best_cut = Some((cut_pos, dist));
+                    }
+                }
+            }
+
+            // Reverse complement orientation: primer ends the preceding amplicon
+            let rc_bytes = primer.sequence_rc.as_bytes();
+            if let Some((offset, dist)) = semi_global_align_find(rc_bytes, middle, max_edit_dist) {
+                let cut_pos = search_start + offset + rc_bytes.len();
+                if cut_pos >= min_subread_len && len - cut_pos >= min_subread_len {
+                    if best_cut.is_none()
+                        || cut_pos < best_cut.unwrap().0.saturating_sub(50)
+                        || (cut_pos <= best_cut.unwrap().0 + 50 && dist < best_cut.unwrap().1)
+                    {
+                        best_cut = Some((cut_pos, dist));
+                    }
+                }
+            }
+
+
+        }
+
+        if let Some((cut_pos, _)) = best_cut {
+            split_count += 1;
+            let sub1 = FastqRead {
+                id: format!("{}_split{}", base_id, split_count),
+                header: format!("@{}_split{}", base_id, split_count),
+                seq: current.seq[..cut_pos].to_vec(),
+                qual: current.qual[..cut_pos].to_vec(),
+            };
+            results.push(sub1);
+
+            split_count += 1;
+            let sub2 = FastqRead {
+                id: format!("{}_split{}", base_id, split_count),
+                header: format!("@{}_split{}", base_id, split_count),
+                seq: current.seq[cut_pos..].to_vec(),
+                qual: current.qual[cut_pos..].to_vec(),
+            };
+            // Check sub2 for further internal splits
+            queue.push_back(sub2);
+        } else {
+            results.push(current);
+        }
+    }
+
+    results
+}
+
 /// Match using sequence alignment and K-mer filtering
+
 fn match_read_sequence(
     record: &bam::Record,
     read_index: usize,
@@ -792,6 +925,7 @@ pub fn run_amplicons(
     output_fastq: Option<&str>,
     output_dimers: Option<&str>,
     split_by_amplicon: bool,
+    split_chimeras: bool,
 ) -> Result<AmpliconResult> {
     run_amplicons_with_callback(
         bam_path,
@@ -811,6 +945,7 @@ pub fn run_amplicons(
         output_fastq,
         output_dimers,
         split_by_amplicon,
+        split_chimeras,
         |_| {},
     )
 }
@@ -833,8 +968,10 @@ pub fn run_amplicons_with_callback<F>(
     output_fastq: Option<&str>,
     output_dimers: Option<&str>,
     split_by_amplicon: bool,
+    split_chimeras: bool,
     mut progress_callback: F,
 ) -> Result<AmpliconResult>
+
 where
     F: FnMut(&AmpliconResult),
 {
@@ -903,6 +1040,7 @@ where
         let mut failed_primer_match = 0usize;
         let mut failed_pair_match = 0usize;
         let mut primer_matching_stats: HashMap<String, PrimerMatchingStats> = HashMap::new();
+        let mut chimera_split_count = 0usize;
 
         loop {
             let mut chunk = Vec::new();
@@ -975,6 +1113,20 @@ where
                 break;
             }
 
+            let chunk = if split_chimeras {
+                let mut expanded = Vec::with_capacity(chunk.len() * 2);
+                for r in chunk {
+                    let subreads = split_chimera_fastq_read(r, &primers, end_length, max_edit_dist);
+                    if subreads.len() > 1 {
+                        chimera_split_count += 1;
+                    }
+                    expanded.extend(subreads);
+                }
+                expanded
+            } else {
+                chunk
+            };
+
             let chunk_results: Vec<MatchResult> = chunk
                 .par_iter()
                 .enumerate()
@@ -991,6 +1143,7 @@ where
                     )
                 })
                 .collect();
+
 
             for mut res in chunk_results {
                 // Record primer matching stats before filtering
@@ -1102,6 +1255,7 @@ where
                 failed_primer_match,
                 failed_pair_match,
                 primer_matching_stats: primer_matching_stats.clone(),
+                split_chimeras_count: chimera_split_count,
             };
             progress_callback(&intermediate);
 
@@ -1133,6 +1287,7 @@ where
             failed_primer_match,
             failed_pair_match,
             primer_matching_stats,
+            split_chimeras_count: chimera_split_count,
         };
 
         if print_summary {
@@ -1170,7 +1325,14 @@ where
                 result.failed_pair_match,
                 result.failed_pair_match as f64 / result.total_reads.max(1) as f64 * 100.0
             );
+            if result.split_chimeras_count > 0 {
+                eprintln!(
+                    "  - Split chimeras:     {:>8} concatemers split into sub-reads",
+                    result.split_chimeras_count
+                );
+            }
             eprintln!("Amplicon types:         {:>8}", result.amplicons.len());
+
 
             if !result.primer_matching_stats.is_empty() {
                 eprintln!("\n=== Primer Matching Details ===");
@@ -1348,7 +1510,9 @@ where
                 failed_primer_match,
                 failed_pair_match,
                 primer_matching_stats: primer_matching_stats.clone(),
+                split_chimeras_count: 0,
             };
+
             progress_callback(&intermediate);
         }
     }
@@ -1470,7 +1634,9 @@ where
         failed_primer_match,
         failed_pair_match,
         primer_matching_stats,
+        split_chimeras_count: 0,
     };
+
 
     if print_summary {
         eprintln!("\n=== nanoparse Summary ===");
@@ -1567,6 +1733,7 @@ pub fn run_amplicons_to_output(
     output_fastq: Option<&str>,
     output_dimers: Option<&str>,
     split_by_amplicon: bool,
+    split_chimeras: bool,
 ) -> Result<()> {
     let result = run_amplicons(
         bam_path,
@@ -1586,7 +1753,73 @@ pub fn run_amplicons_to_output(
         output_fastq,
         output_dimers,
         split_by_amplicon,
+        split_chimeras,
     )?;
     write_output(&result, output_path)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::primers::reverse_complement;
+
+    #[test]
+    fn test_split_chimera_fastq_read() {
+        let fwd = "ACCGCATGTTCCGGGACAAAAG";
+        let rev_rc = "AATCCAGTATCTCAGACGAAGTGGA";
+        let primers = vec![
+            Primer::new("BCR-ABL1minor_fwd", fwd, None),
+            Primer::new("BCR-ABL1_rev", &reverse_complement(rev_rc), None),
+        ];
+
+        // Build synthetic concatemer: Amplicon1 (247 bp) + Amplicon2 (247 bp)
+        let amp1 = format!("{}{}{}", fwd, "A".repeat(200), rev_rc);
+        let amp2 = format!("{}{}{}", fwd, "C".repeat(200), rev_rc);
+        let concatemer = format!("{}{}", amp1, amp2);
+        let qual = vec![b'I'; concatemer.len()];
+
+        let read = FastqRead {
+            id: "read_concatemer".to_string(),
+            header: "@read_concatemer".to_string(),
+            seq: concatemer.into_bytes(),
+            qual,
+        };
+
+        let split = split_chimera_fastq_read(read, &primers, 150, 2);
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0].id, "read_concatemer_split1");
+        assert_eq!(split[1].id, "read_concatemer_split2");
+        assert_eq!(split[0].seq.len(), amp1.len());
+
+
+        assert_eq!(split[1].seq.len(), amp2.len());
+        assert_eq!(split[0].seq, amp1.as_bytes());
+        assert_eq!(split[1].seq, amp2.as_bytes());
+    }
+
+    #[test]
+    fn test_non_chimera_remains_unchanged() {
+        let fwd = "ACCGCATGTTCCGGGACAAAAG";
+        let rev_rc = "AATCCAGTATCTCAGACGAAGTGGA";
+        let primers = vec![
+            Primer::new("BCR-ABL1minor_fwd", fwd, None),
+        ];
+
+
+        let single = format!("{}{}{}", fwd, "G".repeat(200), rev_rc);
+        let read = FastqRead {
+            id: "read_monomer".to_string(),
+            header: "@read_monomer".to_string(),
+            seq: single.clone().into_bytes(),
+            qual: vec![b'I'; single.len()],
+        };
+
+        let split = split_chimera_fastq_read(read, &primers, 150, 2);
+        assert_eq!(split.len(), 1);
+        assert_eq!(split[0].id, "read_monomer");
+        assert_eq!(split[0].seq, single.as_bytes());
+    }
+}
+
+

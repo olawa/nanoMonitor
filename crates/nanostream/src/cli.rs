@@ -105,7 +105,11 @@ pub enum Commands {
         /// If set, split matched FASTQ reads by amplicon name
         #[arg(long, default_value_t = false)]
         split_by_amplicon: bool,
+        /// If set, detect internal primers and split chimeric concatemers into individual sub-reads
+        #[arg(long, default_value_t = false)]
+        split_chimeras: bool,
     },
+
     /// Calculate pore idle-time statistics
     PoreStats {
         /// Optional input BAM/FASTQ(.gz) file
@@ -206,15 +210,26 @@ pub struct SplitArgs {
 
 #[derive(Parser, Clone)]
 pub struct MakePeArgs {
+    /// Input BAM/FASTQ(.gz) file
     pub input: PathBuf,
+    /// Output prefix or path. Use '-' for stdout (interleaved)
     #[arg(short, long)]
     pub output: Option<PathBuf>,
-    #[arg(long, default_value_t = 150)]
+    /// Length of synthetic PE reads (default: 150)
+    #[arg(short = 'l', long, default_value_t = 150)]
     pub len: usize,
-    #[arg(long, default_value_t = 400)]
-    pub insert: usize,
-    #[arg(long, default_value_t = 50)]
-    pub step: usize,
+    /// Insert size (default: 2 * len, e.g. 300 for 150 bp reads)
+    #[arg(short = 'i', long)]
+    pub insert: Option<usize>,
+    /// Step/shift size between consecutive fragments (default: insert, for 100% full coverage tiling)
+    #[arg(short = 's', long, alias = "shift")]
+    pub step: Option<usize>,
+    /// Write R1 and R2 interleaved into a single FASTQ file or stdout
+    #[arg(long, default_value_t = false)]
+    pub interleaved: bool,
+    /// Number of threads for BAM decompression
+    #[arg(short = 't', long, default_value_t = 4)]
+    pub threads: usize,
 }
 
 #[derive(Parser, Clone)]

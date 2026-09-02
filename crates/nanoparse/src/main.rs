@@ -77,7 +77,10 @@ enum Commands {
         output_dimers: Option<String>,
         #[arg(long, default_value_t = false)]
         split_by_amplicon: bool,
+        #[arg(long, default_value_t = false)]
+        split_chimeras: bool,
     },
+
     /// Calculate pore idle-time statistics
     PoreStats {
         input: Option<String>,
@@ -107,7 +110,7 @@ fn main() -> Result<()> {
         Commands::Enrichment { bam, bed, output, threads, cm_range } => {
             enrichment::run_enrichment(&bam, &bed, &output, threads, cm_range.as_deref())?;
         }
-        Commands::Amplicons { bam, primers, output, threads, mode, max_edit_dist, end_length, primer_tolerance, min_qs, len, max_reads, duplex_only, reference, gtf, summary, output_fastq, output_dimers, split_by_amplicon } => {
+        Commands::Amplicons { bam, primers, output, threads, mode, max_edit_dist, end_length, primer_tolerance, min_qs, len, max_reads, duplex_only, reference, gtf, summary, output_fastq, output_dimers, split_by_amplicon, split_chimeras } => {
             let len_range = if len.is_empty() {
                 (0, usize::MAX)
             } else {
@@ -140,8 +143,10 @@ fn main() -> Result<()> {
                 output_fastq.as_deref(),
                 output_dimers.as_deref(),
                 split_by_amplicon,
+                split_chimeras,
             )?;
         }
+
         Commands::PoreStats { input, sequencing_summary, output, threads, max_idle_s, long_idle_s, speed_bps } => {
             pore_stats::run_pore_stats(input.as_deref(), sequencing_summary.as_deref(), output.as_deref(), threads, max_idle_s, long_idle_s, speed_bps)?;
         }

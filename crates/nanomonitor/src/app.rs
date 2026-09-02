@@ -462,7 +462,9 @@ impl NanoMonitorApp {
                 None,
                 None,
                 false,
+                false,
                 |intermediate| {
+
                     let new_data = build_dashboard_from_nanostream(intermediate);
                     let _ = tx_progress.send(WorkerMessage::Progress {
                         input_path: input_path_clone.clone(),
