@@ -1,100 +1,117 @@
-# nanoStream
+# nanoMonitor
 
-`nanoStream` is a high-performance, real-time monitoring and analysis suite for Oxford Nanopore Technologies (ONT) sequencing data. It provides a comprehensive graphical interface (PyQt6) to visualize sequencing metrics, detect structural variants, and monitor targeted amplicons as data is generated.
+`nanoMonitor` is a real-time monitoring and analysis suite for Oxford Nanopore Technologies (ONT) sequencing data. It provides a PyQt6 graphical interface for sequencing metrics, targeted amplicon monitoring, structural-variant exploration, and local/remote analysis workflows.
 
-![nanoStream Overview](snapshot.png)
+![nanoMonitor Overview](snapshot.png)
 
-## Key Features
+## Key features
 
-*   **Real-time Monitoring**: Stream data directly from BAM or FASTQ (including `.gz`) files as they are written by the sequencer.
-*   **Interactive DNA Metrics**: Live-updating, high-fidelity plots for Read Accuracy, Quality Scores (Phred), and Read Length distributions.
-*   **Structural Variant (SV) Discovery**: Interactive genome-wide contact matrix for real-time identification of translocations and fusions.
-*   **Targeted Amplicon Analysis**: Optimized monitoring for specific gene regions with integrated primer and barcode management.
-*   **Duplex Read Detection**: Specialized workflows to monitor and identify duplex read pairs and rates.
-*   **Remote Scalability**: A robust client-server architecture powered by ZeroMQ, enabling remote heavy-lifting analysis with local visualization.
-*   **Genomic Context**: Full support for reference genomes (FASTA), gene models (GTF/Tabix), and BED-based regions of interest.
+- **Real-time monitoring** of BAM or FASTQ/FASTQ.GZ files as they are written by a sequencer.
+- **Interactive read metrics** for accuracy, quality score, read length, barcode and amplicon summaries.
+- **Targeted amplicon analysis** with primer and barcode support.
+- **Structural variant exploration** using whole-genome contact-style plots and region drill-down.
+- **Remote analysis mode** using ZeroMQ so heavy analysis can run on another machine while the GUI runs locally.
+- **Genomic context** using FASTA, GTF/Tabix and BED-style resources.
 
 ## Requirements
 
-- **Python**: 3.9+
-- **Core Dependencies**:
-    - `PyQt6`, `PyQt6-WebEngine`: UI and interactive plot rendering.
-    - `pysam`: Genomic data access (BAM, FASTQ, Tabix).
-    - `numpy`, `scipy`: Numerical processing and KDE density estimation.
-    - `plotly`: Interactive web-based visualizations.
-    - `matplotlib`: Static plotting and SV matrix rendering.
-    - `pyzmq`: High-performance networking for remote analysis.
-    - `intervaltree`: Genomic interval management.
-- **Rust**: Required for building the `ns_rust` highly-optimized lane management module.
+- Python `>=3.10,<3.14`
+- A project-local virtual environment is recommended.
+- Optional: Rust + `maturin` if building the optional Rust acceleration module.
+
+Python dependencies are declared in:
+
+- `pyproject.toml` for `uv`
+- `requirements.txt` for standard `pip`/`venv`
+
+Core dependencies include `PyQt6`, `PyQt6-WebEngine`, `pysam`, `numpy`, `scipy`, `plotly`, `matplotlib`, `pyzmq`, `intervaltree`, `edlib`, and `pandas`.
 
 ## Installation
 
-### 1. Clone the repository
+See [INSTALL.md](INSTALL.md) for detailed setup notes.
+
+Recommended quick start with `uv`:
+
 ```bash
-git clone https://github.com/[your-repo]/nanoStream.git
-cd nanoStream
+git clone git@github.com:olawa/nanoMonitor.git
+cd nanoMonitor
+
+uv python install 3.12
+uv venv --python 3.12
+source .venv/bin/activate
+uv sync
 ```
 
-### 2. Install Python dependencies
+Start the GUI:
+
 ```bash
-pip install PyQt6 PyQt6-WebEngine pysam numpy scipy plotly matplotlib pyzmq intervaltree
+python nanoMonitor.py
 ```
 
-### 3. Build the Rust Optimization Module
-`nanoStream` uses a Rust extension for performance-critical visualization tasks.
+Alternative with standard `venv`:
+
 ```bash
-# Install maturin to build the extension
-pip install maturin
-maturin develop --release
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python nanoMonitor.py
 ```
 
 ## Usage
 
-### Local Monitoring
-To monitor a local BAM file or a directory being written to:
-```bash
-# Single file monitoring
-python nanoMonitor.py --bam /path/to/sequencing_data.bam --primers primers.tsv
+### Local monitoring
 
-# Directory monitoring
-python nanoMonitor.py --dir /path/to/output_fastq_dir/ --threads 12
+Single BAM file:
+
+```bash
+python nanoMonitor.py --bam /path/to/sequencing_data.bam --primers primers.tsv
 ```
 
-### Remote Analysis Mode
-`nanoStream` can run the analysis on a powerful remote server while you monitor the progress on your local workstation.
+Directory monitoring:
 
-1.  **Start the Server** (on the analysis machine):
-    ```bash
-    python ns_server.py --rep-port 5555 --pub-port 5556 --secret my_secure_token
-    ```
+```bash
+python nanoMonitor.py --dir /path/to/output_fastq_dir --threads 12
+```
 
-2.  **Start the Monitor** (on your local machine):
-    ```bash
-    python nanoMonitor.py --server tcp://server_ip:5555 --secret my_secure_token
-    ```
+### Remote analysis mode
 
-### CLI Arguments
+Start the server on the analysis machine:
+
+```bash
+python ns_server.py --rep-port 5555 --pub-port 5556 --secret my_secure_token
+```
+
+Start the monitor locally:
+
+```bash
+python nanoMonitor.py --server tcp://server_ip:5555 --secret my_secure_token
+```
+
+## CLI arguments
 
 | Argument | Description |
 | :--- | :--- |
-| `input` | Optional positional argument for input file. |
-| `--bam` | Path to the input BAM file. |
+| `input` | Optional positional input file. |
+| `--bam` | Path to an input BAM file. |
 | `--primers` | Path to a TSV file containing primer names and sequences. |
 | `--genes` | Path to a GTF or BED file for gene models. |
-| `--threads` | Number of processing threads (default: 8). |
-| `--dir` | Path to a directory for continuous monitoring. |
-| `--server` | Address of a remote NanoStream server (e.g., `tcp://10.0.0.1:5555`). |
-| `--secret` | Authentication secret token for the remote server. |
+| `--threads` | Number of processing threads, default `8`. |
+| `--dir` | Directory for continuous monitoring. |
+| `--server` | Remote server address, for example `tcp://10.0.0.1:5555`. |
+| `--secret` | Authentication secret for remote server mode. |
 
-## Module Architecture
+## Module architecture
 
-- `nanoMonitor.py`: Main application entry point and PyQt6 GUI.
-- `ns_server.py`: Remote analysis server implementation.
-- `ns_core.py`: Core streaming engines for BAM and FASTQ data.
-- `ns_workers.py`: Multi-threaded worker management for local and remote analysis.
-- `ns_structural.py`: Structural variant and contact matrix logic.
-- `ns_visualizer.py`: High-performance BAM/FASTQ region viewer (Snap View).
-- `ns_rust.rs`: Rust implementation for optimized alignment lane calculation.
+- `nanoMonitor.py`: main application entry point and PyQt6 GUI.
+- `python/ns_core.py`: BAM/FASTQ streaming and core metrics.
+- `python/ns_workers.py`: PyQt worker threads and remote ZeroMQ client logic.
+- `python/ns_amplicon.py`: targeted amplicon analysis.
+- `python/ns_rna.py`: RNA/gene counting support.
+- `python/ns_structural.py`: structural variant/contact matrix logic.
+- `python/ns_visualizer.py`: BAM/FASTQ region viewer.
+- `python/ns_resources.py`: FASTA/GTF/BED/primer resource loading.
 
 ---
+
 © 2025 Genomics Suite - Optimized for Nanopore Data Monitoring.
