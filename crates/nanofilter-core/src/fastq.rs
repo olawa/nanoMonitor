@@ -64,27 +64,17 @@ pub fn filter_fastq_with_settings(
                 bam_writer = Some(UnalignedBamWriter::new(output_path, &metadata, settings)?);
             }
 
-            if len >= settings.min_len
-                && len <= settings.max_len
-                && matches_fastq_filters(
-                    &metadata,
-                    settings.channel_range,
-                    settings.time_window.as_ref(),
-                )
-            {
-                let qual = record
-                    .qual()
-                    .ok_or_else(|| anyhow::anyhow!("No quality scores"))?;
-                let avg_qv = read_mean_qv(&metadata, qual);
-                if avg_qv >= settings.qv_threshold {
-                    let id = record.id();
-                    let read_name = id.split(|&b| b == b' ').next().unwrap_or(id);
-                    bam_writer
-                        .as_mut()
-                        .unwrap()
-                        .write_record(read_name, &seq, qual)?;
-                    kept += 1;
-                }
+            let qual = record
+                .qual()
+                .ok_or_else(|| anyhow::anyhow!("No quality scores"))?;
+            if fastq_record_passes(settings, &metadata, len, qual) {
+                let id = record.id();
+                let read_name = id.split(|&b| b == b' ').next().unwrap_or(id);
+                bam_writer
+                    .as_mut()
+                    .unwrap()
+                    .write_record(read_name, &seq, qual)?;
+                kept += 1;
             }
         }
         eprintln!("FASTQ→BAM: Kept {} / {} reads", kept, total);
@@ -105,22 +95,12 @@ pub fn filter_fastq_with_settings(
             let seq = record.seq();
             let len = seq.len();
             let metadata = parse_nanopore_header(record.id());
-            if len >= settings.min_len
-                && len <= settings.max_len
-                && matches_fastq_filters(
-                    &metadata,
-                    settings.channel_range,
-                    settings.time_window.as_ref(),
-                )
-            {
-                let qual = record
-                    .qual()
-                    .ok_or_else(|| anyhow::anyhow!("No quality scores"))?;
-                let avg_qv = read_mean_qv(&metadata, qual);
-                if avg_qv >= settings.qv_threshold {
-                    record.write(&mut writer, None)?;
-                    kept += 1;
-                }
+            let qual = record
+                .qual()
+                .ok_or_else(|| anyhow::anyhow!("No quality scores"))?;
+            if fastq_record_passes(settings, &metadata, len, qual) {
+                record.write(&mut writer, None)?;
+                kept += 1;
             }
         }
         eprintln!("FASTQ: Kept {} / {} reads", kept, total);
@@ -146,6 +126,22 @@ pub fn make_pe(
         summary.total_reads, summary.total_pairs
     );
     Ok(())
+}
+
+/// Whether a FASTQ record passes `settings`: length, pore/time window, and the
+/// basecaller's mean quality (`qs`, else recomputed). This is the single
+/// definition `nanostream filter` applies; other tools that must filter the same
+/// way (the BCR-ABL engine) call it instead of re-implementing it.
+pub fn fastq_record_passes(
+    settings: &FilterSettings,
+    metadata: &NanoporeMetadata,
+    seq_len: usize,
+    qual: &[u8],
+) -> bool {
+    seq_len >= settings.min_len
+        && seq_len <= settings.max_len
+        && matches_fastq_filters(metadata, settings.channel_range, settings.time_window.as_ref())
+        && read_mean_qv(metadata, qual) >= settings.qv_threshold
 }
 
 fn matches_fastq_filters(
