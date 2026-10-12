@@ -26,6 +26,20 @@ impl NanoporeMetadata {
     }
 }
 
+/// The last `_`-separated field of a dorado read group when it is a barcode or
+/// alias label (`barcode01`, `unclassified`, `RB12`, `NB03`, ...), not model text.
+fn looks_like_barcode_suffix(field: &str) -> bool {
+    let lower = field.to_ascii_lowercase();
+    lower == "unclassified"
+        || lower == "no_barcode"
+        || ["barcode", "rb", "nb", "bc"].iter().any(|p| {
+            lower
+                .strip_prefix(p)
+                .map(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+                .unwrap_or(false)
+        })
+}
+
 pub fn parse_nanopore_header(header: &[u8]) -> NanoporeMetadata {
     let header_str = String::from_utf8_lossy(header);
     let parts: Vec<&str> = header_str.split_whitespace().collect();
@@ -69,10 +83,15 @@ pub fn parse_nanopore_header(header: &[u8]) -> NanoporeMetadata {
     // carries the run id and model when the standalone tags are absent.
     let read_group = tags.get("RG").copied().unwrap_or_default();
     let run_id_from_rg = read_group.split('_').next().filter(|s| !s.is_empty());
+    // The trailing barcode field is optional, so only strip it when it looks
+    // like one; otherwise the last model field (e.g. `sup@v5.2.0`) is lost.
     let model_from_rg = read_group
         .split_once('_')
         .map(|(_, rest)| rest)
-        .and_then(|rest| rest.rsplit_once('_').map(|(model, _)| model))
+        .map(|rest| match rest.rsplit_once('_') {
+            Some((model, tail)) if looks_like_barcode_suffix(tail) => model,
+            _ => rest,
+        })
         .filter(|s| !s.is_empty());
 
     NanoporeMetadata {
@@ -133,6 +152,20 @@ mod tests {
         assert_eq!(
             meta.basecall_model.as_deref(),
             Some("dna_r10.4.1_e8.2_400bps_sup@v5.2.0")
+        );
+    }
+
+    #[test]
+    fn read_group_without_barcode_keeps_the_whole_model() {
+        let header = b"@r1 RG:Z:ef769e0a-6c2d-4f1f-9a0c-3b8e5d2a7c41_dna_r10.4.1_e8.2_400bps_sup@v5.2.0";
+        let meta = parse_nanopore_header(header);
+        assert_eq!(
+            meta.basecall_model.as_deref(),
+            Some("dna_r10.4.1_e8.2_400bps_sup@v5.2.0")
+        );
+        assert_eq!(
+            meta.run_id.as_deref(),
+            Some("ef769e0a-6c2d-4f1f-9a0c-3b8e5d2a7c41")
         );
     }
 

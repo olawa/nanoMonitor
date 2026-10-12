@@ -9,6 +9,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::barcode;
+use nanoseq_core::quality::phred_to_fastq_ascii;
 
 #[derive(Debug, Clone)]
 pub struct MakePeConfig {
@@ -243,7 +244,11 @@ fn run_make_pe_bam(
         total_reads += 1;
         let read_name: &[u8] = record.name().map(|n| n.as_ref()).unwrap_or(b"read");
         let seq: Vec<u8> = record.sequence().iter().collect();
-        let qual: Vec<u8> = record.quality_scores().iter().map(|b| b + 33).collect();
+        let qual: Vec<u8> = record
+            .quality_scores()
+            .iter()
+            .map(phred_to_fastq_ascii)
+            .collect();
 
         let (pairs, processed) = process_read_into_pe(read_name, &seq, &qual, config, writer)?;
         if processed {
@@ -396,6 +401,9 @@ mod tests {
         // Check R2 (revcomp of C is G, revcomp of T is A)
         assert!(r2_content.contains("@read1_f0/2\n"));
         assert!(r2_content.contains(&"G".repeat(150))); // revcomp of C..C
+        // Qualities survive FASTQ -> BAM -> pseudo-PE unchanged ('I' = Q40).
+        assert_eq!(r1_content.lines().nth(3).unwrap(), "I".repeat(150));
+        assert_eq!(r2_content.lines().nth(3).unwrap(), "I".repeat(150));
         assert!(r2_content.contains("@read1_f1/2\n"));
         assert!(r2_content.contains(&"A".repeat(150))); // revcomp of T..T
     }
@@ -480,5 +488,8 @@ mod tests {
         assert!(r1_content.contains(&"A".repeat(150)));
         assert!(r2_content.contains("@bam_read_1_f0/2\n"));
         assert!(r2_content.contains(&"G".repeat(150))); // revcomp of C..C
+        // Qualities survive FASTQ -> BAM -> pseudo-PE unchanged ('I' = Q40).
+        assert_eq!(r1_content.lines().nth(3).unwrap(), "I".repeat(150));
+        assert_eq!(r2_content.lines().nth(3).unwrap(), "I".repeat(150));
     }
 }

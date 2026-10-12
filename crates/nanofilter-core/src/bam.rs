@@ -3,7 +3,7 @@ use chrono::{DateTime, FixedOffset};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use nanoseq_core::filters::{PoreRange, TimeWindow};
 use nanoseq_core::header::NanoporeMetadata;
-use nanoseq_core::quality::{mean_qv_from_phred_scores, select_qv};
+use nanoseq_core::quality::{mean_qv_from_phred_scores, phred_to_fastq_ascii, select_qv};
 use noodles::bam;
 use noodles::bgzf;
 use noodles::sam;
@@ -614,7 +614,7 @@ pub fn bam_to_fastq_with_settings_threads(
             writer.write_all(b"\n+\n")?;
             let qual = record.quality_scores();
             for b in qual.iter() {
-                writer.write_all(&[b + 33])?;
+                writer.write_all(&[phred_to_fastq_ascii(b)])?;
             }
             writer.write_all(b"\n")?;
             kept += 1;
@@ -752,24 +752,23 @@ impl UnalignedBamWriter {
         Ok(Self { header, writer })
     }
 
-    pub fn write_record(&mut self, name: &[u8], seq: &[u8], qual: &[u8]) -> Result<()> {
+    /// `qual` is FASTQ ASCII (Phred+33). BAM stores plain Phred scores, so it is
+    /// converted here; storing the ASCII bytes as-is shifted every quality by 33.
+    pub fn write_record(&mut self, name: &[u8], seq: &[u8], qual_ascii: &[u8]) -> Result<()> {
         use sam::alignment::record_buf::RecordBuf;
+
+        let phred: Vec<u8> = qual_ascii.iter().map(|q| q.saturating_sub(33)).collect();
 
         let mut record = RecordBuf::default();
         *record.name_mut() = Some(name.to_vec().into());
         *record.sequence_mut() = seq.to_vec().into();
-        *record.quality_scores_mut() = qual.to_vec().into();
+        *record.quality_scores_mut() = phred.clone().into();
 
         let tag = sam::alignment::record::data::field::Tag::new(b'Q', b'S');
         record.data_mut().insert(
             tag,
             noodles::sam::alignment::record_buf::data::field::Value::Float(
-                mean_qv_from_phred_scores(
-                    &qual
-                        .iter()
-                        .map(|q| q.saturating_sub(33))
-                        .collect::<Vec<_>>(),
-                ) as f32,
+                mean_qv_from_phred_scores(&phred) as f32,
             ),
         );
 
@@ -844,5 +843,89 @@ mod qs_tag_tests {
     fn falls_back_to_the_quality_string_without_the_tag() {
         let record = record_with_tag(*b"xx", BufValue::Float(1.0), &[40; 100]);
         assert!((get_quality_score_lowlevel(&record).unwrap() - 40.0).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod missing_qual_tests {
+    use super::{bam_to_fastq, filter_bam, UnalignedBamWriter};
+    use super::{create_unaligned_header, FilterSettings};
+    use noodles::bam;
+    use noodles::sam::alignment::io::Write as _;
+    use noodles::sam::alignment::RecordBuf;
+    use nanoseq_core::header::NanoporeMetadata;
+    use std::fs;
+    use std::path::Path;
+
+    /// An unaligned BAM holding one 100 bp read whose QUAL is `*` (0xFF per base).
+    fn write_qualityless_bam(path: &Path) {
+        let settings = FilterSettings {
+            qv_threshold: 0.0,
+            min_len: 0,
+            max_len: usize::MAX,
+            channel_range: None,
+            time_window: None,
+        };
+        let header = create_unaligned_header(&NanoporeMetadata::default(), &settings).unwrap();
+        let mut buf = RecordBuf::default();
+        *buf.name_mut() = Some(b"r1".to_vec().into());
+        *buf.sequence_mut() = vec![b'A'; 100].into();
+        // Empty scores with a non-empty sequence are encoded as 0xFF per base.
+
+        let mut writer = bam::io::Writer::new(fs::File::create(path).unwrap());
+        writer.write_header(&header).unwrap();
+        writer.write_alignment_record(&header, &buf).unwrap();
+        writer.try_finish().unwrap();
+    }
+
+    #[test]
+    fn bam_to_fastq_does_not_overflow_on_missing_quality() {
+        let dir = tempfile::tempdir().unwrap();
+        let bam = dir.path().join("in.bam");
+        let fq = dir.path().join("out.fastq");
+        write_qualityless_bam(&bam);
+
+        // Threshold 0: the read is kept, and its quality line is Q0, not garbage.
+        bam_to_fastq(&bam, &fq, 0.0, 0, usize::MAX).unwrap();
+        let text = fs::read_to_string(&fq).unwrap();
+        let qual_line = text.lines().nth(3).unwrap();
+        assert_eq!(qual_line, "!".repeat(100));
+    }
+
+    #[test]
+    fn missing_quality_fails_a_quality_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let bam = dir.path().join("in.bam");
+        let out = dir.path().join("out.bam");
+        write_qualityless_bam(&bam);
+
+        // It used to score Q255 and pass every threshold.
+        filter_bam(&bam, &out, 10.0, 0, usize::MAX).unwrap();
+        let mut reader = bam::io::Reader::new(fs::File::open(&out).unwrap());
+        let _ = reader.read_header().unwrap();
+        let mut record = bam::Record::default();
+        assert_eq!(reader.read_record(&mut record).unwrap(), 0);
+    }
+
+    #[test]
+    fn unaligned_bam_writer_stores_phred_not_ascii() {
+        let dir = tempfile::tempdir().unwrap();
+        let bam = dir.path().join("w.bam");
+        let settings = FilterSettings {
+            qv_threshold: 0.0,
+            min_len: 0,
+            max_len: usize::MAX,
+            channel_range: None,
+            time_window: None,
+        };
+        let mut writer =
+            UnalignedBamWriter::new(&bam, &NanoporeMetadata::default(), &settings).unwrap();
+        writer.write_record(b"r1", &[b'A'; 10], &[b'I'; 10]).unwrap();
+        drop(writer);
+
+        let fq = dir.path().join("w.fastq");
+        bam_to_fastq(&bam, &fq, 0.0, 0, usize::MAX).unwrap();
+        let text = fs::read_to_string(&fq).unwrap();
+        assert_eq!(text.lines().nth(3).unwrap(), "I".repeat(10));
     }
 }

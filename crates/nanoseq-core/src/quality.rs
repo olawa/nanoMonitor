@@ -1,5 +1,28 @@
+/// BAM stores a record with no quality string (`QUAL` = `*`) as `0xFF` for every base.
+pub const BAM_QUAL_MISSING: u8 = 0xFF;
+
+/// True when a BAM quality array carries no real qualities: empty, or all `0xFF`.
+pub fn phred_scores_missing(phred_scores: &[u8]) -> bool {
+    phred_scores.iter().all(|&q| q == BAM_QUAL_MISSING)
+}
+
+/// One BAM Phred score as a FASTQ quality byte.
+///
+/// A missing score (`0xFF`) must not be offset by 33 -- that overflows `u8` -- and
+/// is written as Q0 (`!`) rather than invented: a read without qualities should
+/// fail a quality threshold, not pass it.
+pub fn phred_to_fastq_ascii(phred: u8) -> u8 {
+    if phred == BAM_QUAL_MISSING {
+        b'!'
+    } else {
+        phred.min(93) + 33
+    }
+}
+
 pub fn mean_qv_from_phred_scores(phred_scores: &[u8]) -> f64 {
-    if phred_scores.is_empty() {
+    // Also covers a quality-less BAM record: averaging 0xFF would give Q255 and
+    // pass every threshold.
+    if phred_scores_missing(phred_scores) {
         return 0.0;
     }
 
@@ -30,7 +53,9 @@ pub fn select_qv(explicit_qs: Option<f64>, phred_scores: &[u8]) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{mean_qv_from_fastq_ascii, mean_qv_from_phred_scores, select_qv};
+    use super::{
+        mean_qv_from_fastq_ascii, mean_qv_from_phred_scores, phred_to_fastq_ascii, select_qv,
+    };
 
     #[test]
     fn computes_mean_qv_from_phred_scores() {
@@ -47,5 +72,12 @@ mod tests {
     #[test]
     fn prefers_explicit_qs() {
         assert_eq!(select_qv(Some(17.5), &[40, 40, 40]), 17.5);
+    }
+
+    #[test]
+    fn missing_bam_qualities_have_no_quality() {
+        assert_eq!(mean_qv_from_phred_scores(&[0xFF; 10]), 0.0);
+        assert_eq!(phred_to_fastq_ascii(0xFF), b'!');
+        assert_eq!(phred_to_fastq_ascii(40), b'I');
     }
 }

@@ -1654,7 +1654,7 @@ where
                     let qual_bytes: Vec<u8> = if record.qual().is_empty() {
                         vec![b'?'; seq_bytes.len()]
                     } else {
-                        record.qual().iter().map(|&q| q + 33).collect()
+                        record.qual().iter().map(|&q| nanoseq_core::quality::phred_to_fastq_ascii(q)).collect()
                     };
 
                     if top_n > 0 {
