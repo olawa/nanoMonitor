@@ -1068,7 +1068,7 @@ pub fn run_amplicons(
         split_by_amplicon,
         split_chimeras,
         top_n,
-        |_| {},
+        None::<fn(&AmpliconResult)>,
     )
 }
 
@@ -1092,7 +1092,7 @@ pub fn run_amplicons_with_callback<F>(
     split_by_amplicon: bool,
     split_chimeras: bool,
     top_n: usize,
-    mut progress_callback: F,
+    mut progress_callback: Option<F>,
 ) -> Result<AmpliconResult>
 
 where
@@ -1374,26 +1374,30 @@ where
                 }
             }
 
-            let mut current_amplicons = amplicons.clone();
-            for stats in current_amplicons.values_mut() {
-                stats.finalize();
+            // Building a snapshot clones every amplicon (and every read id), so only
+            // do it when somebody is listening; otherwise long CLI runs go quadratic.
+            if let Some(cb) = progress_callback.as_mut() {
+                let mut current_amplicons = amplicons.clone();
+                for stats in current_amplicons.values_mut() {
+                    stats.finalize();
+                }
+                let intermediate = AmpliconResult {
+                    amplicons: current_amplicons,
+                    chimera_count,
+                    unmatched_count,
+                    total_reads,
+                    rescued_count: 0,
+                    distributions: build_distributions_from_values(&dist_lengths, &dist_qs),
+                    total_raw_reads,
+                    failed_len_filter,
+                    failed_qs_filter,
+                    failed_primer_match,
+                    failed_pair_match,
+                    primer_matching_stats: primer_matching_stats.clone(),
+                    split_chimeras_count: chimera_split_count,
+                };
+                cb(&intermediate);
             }
-            let intermediate = AmpliconResult {
-                amplicons: current_amplicons,
-                chimera_count,
-                unmatched_count,
-                total_reads,
-                rescued_count: 0,
-                distributions: build_distributions_from_values(&dist_lengths, &dist_qs),
-                total_raw_reads,
-                failed_len_filter,
-                failed_qs_filter,
-                failed_primer_match,
-                failed_pair_match,
-                primer_matching_stats: primer_matching_stats.clone(),
-                split_chimeras_count: chimera_split_count,
-            };
-            progress_callback(&intermediate);
 
             if reached_eof || (max_reads > 0 && total_reads >= max_reads) {
                 break;
@@ -1695,27 +1699,31 @@ where
         }
 
         if total_seen % 500 == 0 {
-            let mut current_amplicons = amplicons.clone();
-            for stats in current_amplicons.values_mut() {
-                stats.finalize();
-            }
-            let intermediate = AmpliconResult {
-                amplicons: current_amplicons,
-                chimera_count,
-                unmatched_count: unassigned_results.len(),
-                total_reads: total_processed,
-                rescued_count: 0,
-                distributions: build_distributions_from_values(&dist_lengths, &dist_qs),
-                total_raw_reads,
-                failed_len_filter,
-                failed_qs_filter,
-                failed_primer_match,
-                failed_pair_match,
-                primer_matching_stats: primer_matching_stats.clone(),
-                split_chimeras_count: 0,
-            };
+            // Building a snapshot clones every amplicon (and every read id), so only
+            // do it when somebody is listening; otherwise long CLI runs go quadratic.
+            if let Some(cb) = progress_callback.as_mut() {
+                let mut current_amplicons = amplicons.clone();
+                for stats in current_amplicons.values_mut() {
+                    stats.finalize();
+                }
+                let intermediate = AmpliconResult {
+                    amplicons: current_amplicons,
+                    chimera_count,
+                    unmatched_count: unassigned_results.len(),
+                    total_reads: total_processed,
+                    rescued_count: 0,
+                    distributions: build_distributions_from_values(&dist_lengths, &dist_qs),
+                    total_raw_reads,
+                    failed_len_filter,
+                    failed_qs_filter,
+                    failed_primer_match,
+                    failed_pair_match,
+                    primer_matching_stats: primer_matching_stats.clone(),
+                    split_chimeras_count: 0,
+                };
 
-            progress_callback(&intermediate);
+                cb(&intermediate);
+            }
         }
     }
 

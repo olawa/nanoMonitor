@@ -464,15 +464,14 @@ impl NanoMonitorApp {
                 false,
                 false,
                 0,
-                |intermediate| {
-
+                Some(|intermediate: &nanoparse_core::matcher::AmpliconResult| {
                     let new_data = build_dashboard_from_nanostream(intermediate);
                     let _ = tx_progress.send(WorkerMessage::Progress {
                         input_path: input_path_clone.clone(),
                         processed_reads: intermediate.total_reads,
                         current_data: new_data,
                     });
-                }
+                }),
             ) {
                 Ok(parsed) => Ok(build_dashboard_from_nanostream(&parsed)),
                 Err(e) => Err(format!("nanostream core failed: {}", e)),
