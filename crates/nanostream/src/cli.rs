@@ -318,6 +318,13 @@ pub enum BcrAblCommand {
     Snapshot(BcrSnapshotArgs),
     /// Run nagini's BCR-ABL scripts (fusion isoform, kinase-domain mutations, phasing) on the current snapshots
     Analyze(BcrAnalyzeArgs),
+    /// Gather the final BAMs into the layout nagini reads (`barcodeNN.bam` + a barcode map); the engine must be stopped
+    Handoff(BcrHandoffArgs),
+    /// Start, check, follow or stop the final nagini run on a hand-off
+    #[command(subcommand)]
+    Nagini(BcrNaginiCommand),
+    /// Compare the preliminary results with nagini's final results
+    Compare(BcrCompareArgs),
     /// Feed a finished run into a directory the way MinKNOW would (for testing)
     Replay(BcrReplayArgs),
 }
@@ -423,4 +430,72 @@ pub struct BcrReplayArgs {
     /// Write final_summary_replay.txt at the end, as MinKNOW does
     #[arg(long, default_value_t = false)]
     pub finish: bool,
+}
+
+#[derive(Parser, Clone)]
+pub struct BcrHandoffArgs {
+    /// Engine output directory
+    pub out: PathBuf,
+    /// Barcode map CSV/TSV (barcode, sample, type, assay, library_type)
+    #[arg(long)]
+    pub barcode_map: Option<PathBuf>,
+    /// Write a barcode map template with every barcode the engine saw, then stop
+    #[arg(long)]
+    pub init_map: Option<PathBuf>,
+    /// Hand-off folder (default: <out>/handoff)
+    #[arg(long)]
+    pub handoff: Option<PathBuf>,
+    #[arg(short, long, default_value_t = 8)]
+    pub threads: usize,
+    #[arg(long, default_value = "samtools")]
+    pub samtools: String,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum BcrNaginiCommand {
+    /// Ask snakemake whether the workflow can be built here (`--dry-run`), without running it
+    Check(BcrNaginiArgs),
+    /// Start the run in the background
+    Start(BcrNaginiArgs),
+    /// Show progress and outcome
+    Status {
+        /// nagini analysis folder
+        analysis: PathBuf,
+    },
+    /// Interrupt a running pipeline
+    Stop {
+        analysis: PathBuf,
+    },
+}
+
+#[derive(Parser, Clone)]
+pub struct BcrNaginiArgs {
+    /// Engine output directory (its hand-off folder is used)
+    pub out: PathBuf,
+    #[arg(long)]
+    pub nagini: PathBuf,
+    /// nagini analysis folder (default: <out>/nagini_run)
+    #[arg(long)]
+    pub analysis: Option<PathBuf>,
+    #[arg(long)]
+    pub handoff: Option<PathBuf>,
+    #[arg(long, default_value = "workstation")]
+    pub site: String,
+    #[arg(long, default_value = "hg19")]
+    pub build: String,
+    #[arg(long)]
+    pub cores: Option<usize>,
+    #[arg(long, default_value_t = false)]
+    pub enable_rindels: bool,
+}
+
+#[derive(Parser, Clone)]
+pub struct BcrCompareArgs {
+    /// Engine output directory
+    pub out: PathBuf,
+    /// nagini analysis folder (default: <out>/nagini_run)
+    #[arg(long)]
+    pub analysis: Option<PathBuf>,
+    #[arg(long)]
+    pub handoff: Option<PathBuf>,
 }

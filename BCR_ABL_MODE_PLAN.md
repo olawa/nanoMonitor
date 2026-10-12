@@ -267,6 +267,36 @@ exists, using the `image` crate already in the lockfile rather than `egui_extras
   MultiQC html; table comparing prelim vs final per sample, flagging any change in isoform or
   mutation calls.
 
+#### Phase 4 status (2026-10-12): implemented; the real nagini run is NOT verified here
+
+Engine side (`nanobcr-core`): `handoff` (barcode-map read/validate/template; `prepare` refuses while the engine is
+active, does the final compaction, hard-links `barcodeNN.bam` + `.bai` for the barcodes that have a sample,
+`samtools quickcheck`, checks primary-alignment counts against the engine's counters, writes `barcode_map.csv`
+(only the handed-over barcodes), `handoff.json` and a copy of `provenance.json`), `pipeline` (builds
+`start_nagini.sh --input-type aligned_bam --assay bcr_abl --library-type cdna --reference-build hg19 --barcode-map ...`,
+runs it in its own process group with an exit-code wrapper, `dry_run`, `status` from the exit file + pid +
+snakemake log "N of M steps", `stop` = SIGINT to the group; success requires exit 0 AND the summary workbook),
+`results` (reads nagini's `results/reports/bcr_abl/{sample}_{type}.*`: fusion, Branford, phasing, exon coverage,
+plot, workbooks; `compare` against the preliminary result). CLI: `bcr-abl handoff|nagini check|start|status|stop|compare`.
+GUI: a "Final analysis (nagini)" tab with the four steps (barcode map with template creation; hand-off; run with
+dry-run check, progress bar, failed rules, log; results with the fusion plot, tables, exon coverage, comparison
+with the preliminary result and buttons for the workbooks/MultiQC).
+
+Verified: the hand-off of the real barcode24 engine output; `prepare_nagini_inputs.py` accepts the layout (earlier);
+nagini's own scripts run on the handed-over BAM give results that `results::load_sample` reads and `compare`
+reports as identical to the preliminary ones (gen 3 vs gen 3). Pipeline control is tested against a fake launcher
+(success, failure with rule name, exit 0 without workbook, vanished process, refusal to start twice).
+
+NOT verified: an actual snakemake run. On this Mac `snakemake 9.25` cannot parse nagini (hydra-genetics needs
+Snakemake 7: `ImportError: DeploymentMethod`) and there is no singularity, so even `--dry-run` fails before the DAG is built.
+The first real run therefore needs the workstation: use "Check (dry run)" first. Unknowns to confirm there:
+the exact snakemake progress wording in `.snakemake/log` (the parser accepts the Snakemake 7 and 9 `N of M steps (P%) done`),
+that the per-sample workbook is at `results/reports/{sample}_{type}.nagini_report.xlsx`, and that `fusion_plot.png`
+is produced (the Arriba container may fall back to matplotlib).
+
+Open: a failed run is resumed by starting again (snakemake picks up what finished); there is no "re-run" button that adds
+`--unlock`. If nagini needs different `min_qv`/length for the same reads it cannot apply them (`aligned_bam` skips its read filter).
+
 ## Not in scope / deferred
 
 - In-process alignment (no minimap2 subprocess), remote/ZeroMQ monitoring, hg38 BCR-ABL.

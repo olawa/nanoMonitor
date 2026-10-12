@@ -719,4 +719,51 @@ mod tests {
         assert_eq!(history.lines().count(), 2);
         assert_eq!(engine.state.barcodes["barcode01"].prelim_generation, Some(2));
     }
+
+    #[test]
+    fn handoff_gathers_mapped_barcodes_and_nagini_can_read_the_layout() {
+        if !tools_available() {
+            return;
+        }
+        use crate::handoff;
+        let mut fx = Fixture::new();
+        let b1 = fx.write_chunk("fastq_pass/barcode01/a_0.fastq.gz", 60, true);
+        fx.write_chunk("fastq_pass/barcode02/b_0.fastq.gz", 40, true);
+        fx.write_chunk("fastq_pass/barcode03/c_0.fastq.gz", 40, true);
+        let mut cfg = fx.config();
+        cfg.snapshot_secs = 100_000; // leave the segments for the hand-off to compact
+        let mut engine = Engine::new(cfg.clone()).unwrap();
+        engine.step(true).unwrap();
+        engine.save_state().unwrap();
+        let out = fx.root.join("out");
+
+        // A live engine blocks the hand-off.
+        let map = fx.root.join("map.csv");
+        std::fs::write(&map, "barcode,sample,type\nbarcode01,PAT_A,T\nbarcode03,PAT_C,N\nbarcode09,GHOST,T\n").unwrap();
+        let hand = fx.root.join("handoff");
+        let err = handoff::prepare(&out, &hand, &map, "samtools", 2).unwrap_err().to_string();
+        assert!(err.contains("still running"), "{err}");
+
+        engine.run(&AtomicBool::new(false)).unwrap(); // clean finish
+        std::fs::create_dir_all(&hand).unwrap();
+        std::fs::write(hand.join("barcode77.bam"), "stale").unwrap();
+        let h = handoff::prepare(&out, &hand, &map, "samtools", 2).unwrap();
+
+        let got: Vec<_> = h.barcodes.iter().map(|b| (b.barcode.as_str(), b.sample.as_str(), b.sample_type.as_str())).collect();
+        assert_eq!(got, [("barcode01", "PAT_A", "T"), ("barcode03", "PAT_C", "N")]);
+        assert_eq!(h.skipped, [("barcode02".to_string(), "no sample in the barcode map".to_string())]);
+        assert!(h.warnings.iter().any(|w| w.contains("barcode09") && w.contains("no reads")), "{:?}", h.warnings);
+        assert!(h.warnings.iter().all(|w| !w.contains("primary alignments")), "counts must agree: {:?}", h.warnings);
+        assert_eq!(h.barcodes[0].primary_records as usize, b1.len());
+        assert!(!hand.join("barcode77.bam").exists(), "stale BAMs are removed");
+        for b in ["barcode01", "barcode03"] {
+            assert!(hand.join(format!("{b}.bam")).is_file() && hand.join(format!("{b}.bam.bai")).is_file());
+            assert!(Command::new("samtools").arg("quickcheck").arg(hand.join(format!("{b}.bam"))).status().unwrap().success());
+        }
+        assert!(!hand.join("barcode02.bam").exists());
+        // The map nagini reads has exactly the handed-over barcodes.
+        let used = handoff::read_map(&h.barcode_map).unwrap();
+        assert_eq!(used.iter().map(|r| r.sample.as_str()).collect::<Vec<_>>(), ["PAT_A", "PAT_C"]);
+        assert!(hand.join("provenance.json").is_file() && handoff::load(&hand).unwrap().barcodes.len() == 2);
+    }
 }

@@ -1,24 +1,26 @@
 use super::data::{self, BcrData, Liveness};
+use super::final_run::{FinalEnv, FinalRun};
 use super::proc::{self, BcrSetup, EngineProc};
 use eframe::egui::{self, Color32, RichText};
 use egui_plot::{Legend, Line, Plot, PlotPoints};
 use nanobcr_core::preflight::{self, Check, CheckStatus};
-use nanobcr_core::prelim::PrelimSummary;
+use nanobcr_core::prelim::{BranfordSummary, FusionSummary, PhasePair, PrelimSummary};
 use nanobcr_core::state::{now_unix, BarcodeState};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const RELOAD_EVERY: Duration = Duration::from_millis(1500);
 
-const GREEN: Color32 = Color32::from_rgb(80, 170, 100);
-const AMBER: Color32 = Color32::from_rgb(230, 170, 40);
-const RED: Color32 = Color32::from_rgb(220, 70, 70);
-const GREY: Color32 = Color32::from_rgb(140, 140, 150);
+pub(super) const GREEN: Color32 = Color32::from_rgb(80, 170, 100);
+pub(super) const AMBER: Color32 = Color32::from_rgb(230, 170, 40);
+pub(super) const RED: Color32 = Color32::from_rgb(220, 70, 70);
+pub(super) const GREY: Color32 = Color32::from_rgb(140, 140, 150);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Samples,
     Detail,
+    Final,
     Log,
 }
 
@@ -32,6 +34,7 @@ pub struct BcrApp {
     tab: Tab,
     message: Option<(bool, String)>,
     log_tail: Vec<String>,
+    final_run: FinalRun,
 }
 
 pub struct BcrStartup {
@@ -50,6 +53,7 @@ impl BcrApp {
             tab: Tab::Samples,
             message: None,
             log_tail: Vec::new(),
+            final_run: FinalRun::default(),
         };
         app.reload();
         app
@@ -123,12 +127,14 @@ impl BcrApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Samples, "Samples");
                 ui.selectable_value(&mut self.tab, Tab::Detail, "Sample detail");
+                ui.selectable_value(&mut self.tab, Tab::Final, "Final analysis (nagini)");
                 ui.selectable_value(&mut self.tab, Tab::Log, "Engine log");
             });
             ui.separator();
             match self.tab {
                 Tab::Samples => self.samples_tab(ui),
                 Tab::Detail => self.detail_tab(ui),
+                Tab::Final => self.final_tab(ui),
                 Tab::Log => self.log_tab(ui),
             }
         });
@@ -362,16 +368,35 @@ impl BcrApp {
         egui::ScrollArea::vertical().show(ui, |ui| {
             summary_header(ui, &summary, state.as_ref());
             ui.add_space(8.0);
-            fusion_section(ui, &summary, data::isoform_changed(&history));
+            fusion_section(ui, summary.fusion.as_ref(), data::isoform_changed(&history));
             ui.add_space(8.0);
-            mutation_section(ui, &summary);
+            mutation_section(ui, summary.branford.as_ref());
             ui.add_space(8.0);
-            phasing_section(ui, &summary);
+            phasing_section(ui, summary.phasing.as_ref());
             ui.add_space(8.0);
             coverage_section(ui, &summary);
             ui.add_space(8.0);
             history_plots(ui, &history);
         });
+    }
+
+    fn final_tab(&mut self, ui: &mut egui::Ui) {
+        let alive = self.engine_alive();
+        let barcodes = self.known_barcodes();
+        let out = self.out_dir();
+        let nagini = {
+            let t = self.setup.nagini_dir.trim();
+            (!t.is_empty()).then(|| PathBuf::from(t))
+        };
+        let env = FinalEnv {
+            out_dir: out.as_deref(),
+            nagini_dir: nagini.as_deref(),
+            engine_alive: alive,
+            barcodes: &barcodes,
+            threads: self.setup.threads,
+            build: &self.setup.build,
+        };
+        self.final_run.show(ui, &env);
     }
 
     // ------------------------------------------------------------ log
@@ -466,13 +491,13 @@ fn summary_header(ui: &mut egui::Ui, s: &PrelimSummary, b: Option<&BarcodeState>
     }
 }
 
-fn section_title(ui: &mut egui::Ui, title: &str) {
+pub(super) fn section_title(ui: &mut egui::Ui, title: &str) {
     ui.label(RichText::new(title).strong().size(16.0));
 }
 
-fn fusion_section(ui: &mut egui::Ui, s: &PrelimSummary, changed: bool) {
+pub(super) fn fusion_section(ui: &mut egui::Ui, f: Option<&FusionSummary>, changed: bool) {
     section_title(ui, "Fusion isoform");
-    let Some(f) = &s.fusion else {
+    let Some(f) = f else {
         ui.label("Not available.");
         return;
     };
@@ -517,9 +542,9 @@ fn tki_color(class: &str) -> Color32 {
     }
 }
 
-fn mutation_section(ui: &mut egui::Ui, s: &PrelimSummary) {
+pub(super) fn mutation_section(ui: &mut egui::Ui, b: Option<&BranfordSummary>) {
     section_title(ui, "ABL1 kinase-domain mutations");
-    let Some(b) = &s.branford else {
+    let Some(b) = b else {
         ui.label("Not available.");
         return;
     };
@@ -550,9 +575,9 @@ fn mutation_section(ui: &mut egui::Ui, s: &PrelimSummary) {
     });
 }
 
-fn phasing_section(ui: &mut egui::Ui, s: &PrelimSummary) {
+pub(super) fn phasing_section(ui: &mut egui::Ui, p: Option<&Vec<PhasePair>>) {
     section_title(ui, "Compound mutations (single-molecule phasing)");
-    match &s.phasing {
+    match p {
         None => {
             ui.label("Not available.");
         }
@@ -702,7 +727,7 @@ mod tests {
         let setup = BcrSetup { out_dir: tmp.path().to_string_lossy().into(), ..Default::default() };
         let mut app = BcrApp::new(BcrStartup { setup });
         assert_eq!(app.selected.as_deref(), Some("barcode24"));
-        for tab in [Tab::Samples, Tab::Detail, Tab::Log] {
+        for tab in [Tab::Samples, Tab::Detail, Tab::Final, Tab::Log] {
             app.tab = tab;
             run_frames(&mut app, 3);
         }
@@ -713,7 +738,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         for out in [String::new(), tmp.path().to_string_lossy().into(), "/no/such/dir".to_string()] {
             let mut app = BcrApp::new(BcrStartup { setup: BcrSetup { out_dir: out, ..Default::default() } });
-            for tab in [Tab::Samples, Tab::Detail, Tab::Log] {
+            for tab in [Tab::Samples, Tab::Detail, Tab::Final, Tab::Log] {
                 app.tab = tab;
                 run_frames(&mut app, 2);
             }
@@ -729,5 +754,76 @@ mod tests {
         app.tab = Tab::Detail;
         run_frames(&mut app, 2);
         assert!(!app.data.problems.is_empty());
+    }
+
+    /// A finished nagini run next to the engine output, with the same T315I/e1a2 result.
+    fn finished_run(dir: &Path, same: bool) {
+        use nanobcr_core::handoff::{Handoff, HandoffBarcode};
+        let hand = dir.join("handoff");
+        fs::create_dir_all(&hand).unwrap();
+        let h = Handoff {
+            dir: hand.clone(),
+            barcode_map: hand.join("barcode_map.csv"),
+            written_unix: now_unix(),
+            barcodes: vec![HandoffBarcode {
+                barcode: "barcode24".into(),
+                sample: "PAT".into(),
+                sample_type: "T".into(),
+                bam: hand.join("barcode24.bam"),
+                snapshot_generation: 3,
+                primary_records: 2742,
+                reads_passed: 2742,
+            }],
+            skipped: vec![("barcode99".into(), "no sample in the barcode map".into())],
+            warnings: vec!["barcode09 (GHOST) is in the barcode map but the engine has no reads for it".into()],
+        };
+        fs::write(hand.join("handoff.json"), serde_json::to_vec(&h).unwrap()).unwrap();
+        fs::write(hand.join("provenance.json"), r#"{"minimap2":"2.31","alignment":{"preset":"splice","extra":["-y","-Y","--MD"]},"read_filter":{"min_qv":20.0,"min_len":500,"max_len":3000}}"#).unwrap();
+
+        let a = dir.join("nagini_run");
+        let rep = a.join("results/reports/bcr_abl");
+        fs::create_dir_all(&rep).unwrap();
+        let iso = if same { "e1a2" } else { "e14a2" };
+        fs::write(rep.join("PAT_T.fusion_summary.json"), format!(r#"{{"total_fusion_reads":1607,"primary_isoform":"{iso}","isoforms":[{{"fusion_isoform":"{iso}","protein_form":"p190","read_count":1566,"fraction_percent":97.4,"status":"PRIMARY"}}]}}"#)).unwrap();
+        fs::write(rep.join("PAT_T.branford_all_sites.tsv"), "sample\tchrom\tpos\tdepth\nx\tchr9\t1\t900\n").unwrap();
+        fs::write(rep.join("PAT_T.branford_mutations.tsv"), "sample\tchrom\tpos\tmutation\taa_change\tdepth\tad_alt\tvaf_percent\tstatus\timatinib\nx\tchr9\t133748283\tT315I\tp.Thr315Ile\t1618\t38\t2.349\tDETECTED\tResistant\n").unwrap();
+        fs::write(rep.join("PAT_T.phasing.json"), r#"{"phased_pairs":[{"mutation_1":"Y253H","mutation_2":"T315I","phase_state":"CIS (Compound)","cis_fraction_percent":90.2,"total_spanning_reads":1585}]}"#).unwrap();
+        fs::write(rep.join("PAT_T.exon_coverage.tsv"), "sample\texon\tmean_depth\tpct_gte_100x\tspanning_reads\nx\tABL1_e2\t1626.1\t100.0\t1625\n").unwrap();
+        // A real (tiny) PNG so the texture path is exercised.
+        image::RgbaImage::from_pixel(8, 4, image::Rgba([10, 120, 200, 255])).save(rep.join("PAT_T.fusion_plot.png")).unwrap();
+        fs::write(a.join("results/reports/nagini_summary_report.xlsx"), "x").unwrap();
+        let rec = nanobcr_core::pipeline::RunRecord {
+            pid: 1, started_unix: now_unix() - 600, command: vec![], analysis_dir: a.clone(), handoff_dir: hand.clone(), barcode_map: hand.join("barcode_map.csv"),
+        };
+        fs::write(nanobcr_core::pipeline::run_record_path(&a), serde_json::to_vec(&rec).unwrap()).unwrap();
+        fs::write(nanobcr_core::pipeline::exit_file(&a), "0\n").unwrap();
+        fs::create_dir_all(a.join(".snakemake/log")).unwrap();
+        fs::write(a.join(".snakemake/log/x.snakemake.log"), "rule one:\n8 of 8 steps (100%) done\n").unwrap();
+    }
+
+    #[test]
+    fn the_final_tab_shows_nagini_results_and_an_identical_comparison() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path());
+        finished_run(tmp.path(), true);
+        let setup = BcrSetup { out_dir: tmp.path().to_string_lossy().into(), nagini_dir: "/some/nagini".into(), ..Default::default() };
+        let mut app = BcrApp::new(BcrStartup { setup });
+        app.tab = Tab::Final;
+        run_frames(&mut app, 3);
+        let f = &app.final_run;
+        assert_eq!(f.results_len(), 1);
+        assert_eq!(f.comparison_identical("barcode24"), Some(true));
+    }
+
+    #[test]
+    fn a_difference_between_preliminary_and_final_is_surfaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path());
+        finished_run(tmp.path(), false);
+        let setup = BcrSetup { out_dir: tmp.path().to_string_lossy().into(), nagini_dir: "/some/nagini".into(), ..Default::default() };
+        let mut app = BcrApp::new(BcrStartup { setup });
+        app.tab = Tab::Final;
+        run_frames(&mut app, 3);
+        assert_eq!(app.final_run.comparison_identical("barcode24"), Some(false));
     }
 }

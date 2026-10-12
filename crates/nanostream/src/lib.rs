@@ -248,6 +248,91 @@ pub fn run_bcr_abl(cmd: cli::BcrAblCommand) -> Result<()> {
             }
             Ok(())
         }
+        cli::BcrAblCommand::Handoff(a) => {
+            use nanobcr_core::handoff;
+            if let Some(path) = a.init_map {
+                let state: nanobcr_core::state::State = serde_json::from_slice(&std::fs::read(a.out.join("state.json"))?)?;
+                let barcodes: Vec<String> = state.barcodes.keys().cloned().collect();
+                handoff::write_map(&path, &handoff::template_for(&barcodes))?;
+                eprintln!("wrote {} ({} barcodes): put the real sample names in the `sample` column", path.display(), barcodes.len());
+                return Ok(());
+            }
+            let map = a.barcode_map.ok_or_else(|| anyhow::anyhow!("--barcode-map is required (or --init-map to create one)"))?;
+            let dir = a.handoff.unwrap_or_else(|| a.out.join("handoff"));
+            let h = handoff::prepare(&a.out, &dir, &map, &a.samtools, a.threads)?;
+            for b in &h.barcodes {
+                println!("{}\t{}\t{}\tgen{}\t{} primary alignments", b.barcode, b.sample, b.sample_type, b.snapshot_generation, b.primary_records);
+            }
+            for (b, why) in &h.skipped {
+                eprintln!("skipped {b}: {why}");
+            }
+            for w in &h.warnings {
+                eprintln!("warning: {w}");
+            }
+            println!("hand-off folder: {}", h.dir.display());
+            Ok(())
+        }
+        cli::BcrAblCommand::Nagini(cmd) => {
+            use nanobcr_core::pipeline;
+            let build = |a: &cli::BcrNaginiArgs| {
+                let handoff = a.handoff.clone().unwrap_or_else(|| a.out.join("handoff"));
+                let analysis = a.analysis.clone().unwrap_or_else(|| a.out.join("nagini_run"));
+                let mut c = pipeline::PipelineConfig::new(a.nagini.clone(), analysis, handoff.clone(), handoff.join("barcode_map.csv"));
+                c.site = a.site.clone();
+                c.build = a.build.clone();
+                c.cores = a.cores;
+                c.enable_rindels = a.enable_rindels;
+                c
+            };
+            match cmd {
+                cli::BcrNaginiCommand::Check(a) => {
+                    let r = pipeline::dry_run(&build(&a))?;
+                    println!("{}", r.tail);
+                    if !r.ok {
+                        bail!("snakemake dry run failed");
+                    }
+                    Ok(())
+                }
+                cli::BcrNaginiCommand::Start(a) => {
+                    let rec = pipeline::start(&build(&a))?;
+                    println!("started (pid {}); log: {}", rec.pid, pipeline::log_file(&rec.analysis_dir).display());
+                    Ok(())
+                }
+                cli::BcrNaginiCommand::Status { analysis } => {
+                    let s = pipeline::status(&analysis);
+                    println!("{:?}  {}/{} steps ({}%)  recent: {}", s.state, s.progress.done, s.progress.total, s.progress.percent, s.progress.recent_rules.join(", "));
+                    Ok(())
+                }
+                cli::BcrNaginiCommand::Stop { analysis } => pipeline::stop(&analysis),
+            }
+        }
+        cli::BcrAblCommand::Compare(a) => {
+            use nanobcr_core::{handoff, results};
+            let dir = a.handoff.unwrap_or_else(|| a.out.join("handoff"));
+            let analysis = a.analysis.unwrap_or_else(|| a.out.join("nagini_run"));
+            let h = handoff::load(&dir).ok_or_else(|| anyhow::anyhow!("no hand-off in {}", dir.display()))?;
+            for b in &h.barcodes {
+                let fin = results::load_sample(&analysis, &b.barcode, &b.sample, &b.sample_type, 50);
+                for p in &fin.problems {
+                    eprintln!("{}: {p}", b.sample);
+                }
+                match results::load_prelim(&a.out, &b.barcode)? {
+                    None => println!("{}\tno preliminary result to compare with", b.sample),
+                    Some(p) => {
+                        let c = results::compare(&p, &fin, b.snapshot_generation);
+                        if c.identical() {
+                            println!("{}\tidentical (preliminary gen{} vs hand-off gen{})", b.sample, c.preliminary_generation, c.handoff_generation);
+                        } else {
+                            println!("{}\t{} difference(s):", b.sample, c.differences.len());
+                            for d in &c.differences {
+                                println!("    {d:?}");
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
         cli::BcrAblCommand::Replay(a) => {
             let mut cfg = replay::ReplayConfig::new(a.src, a.dest);
             cfg.interval_secs = a.interval;

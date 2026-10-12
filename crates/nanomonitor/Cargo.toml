@@ -15,6 +15,7 @@ nanoparse-core = { path = "../nanoparse-core" }
 nanofilter-core = { path = "../nanofilter-core" }
 nanoseq-core = { path = "../nanoseq-core" }
 nanobcr-core = { path = "../nanobcr-core" }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 tempfile = "3"

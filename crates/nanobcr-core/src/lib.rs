@@ -9,11 +9,14 @@
 pub mod align;
 pub mod config;
 pub mod engine;
+pub mod handoff;
 pub mod ledger;
+pub mod pipeline;
 pub mod preflight;
 pub mod prelim;
 pub mod reads;
 pub mod replay;
+pub mod results;
 pub mod state;
 pub mod store;
 pub mod watcher;

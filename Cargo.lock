@@ -2207,6 +2207,7 @@ dependencies = [
  "clap",
  "eframe",
  "egui_plot",
+ "image",
  "nanobcr-core",
  "nanofilter-core",
  "nanoparse-core",
@@ -2265,6 +2266,7 @@ dependencies = [
  "nanofilter-core",
  "nanoparse-core",
  "nanoseq-core",
+ "serde_json",
  "tempfile",
 ]
 
