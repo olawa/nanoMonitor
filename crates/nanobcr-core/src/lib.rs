@@ -11,6 +11,7 @@ pub mod config;
 pub mod engine;
 pub mod ledger;
 pub mod reads;
+pub mod replay;
 pub mod state;
 pub mod store;
 pub mod watcher;

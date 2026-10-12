@@ -44,11 +44,17 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(cfg: EngineConfig) -> Result<Self> {
+    pub fn new(mut cfg: EngineConfig) -> Result<Self> {
         if !cfg.input_dir.is_dir() {
             bail!("input directory {} does not exist", cfg.input_dir.display());
         }
         std::fs::create_dir_all(&cfg.out_dir)?;
+        // Absolute paths, because state.json and provenance.json are read by other
+        // processes (the GUI, nagini) that do not share this working directory.
+        cfg.input_dir = std::fs::canonicalize(&cfg.input_dir)?;
+        cfg.out_dir = std::fs::canonicalize(&cfg.out_dir)?;
+        cfg.reference = std::fs::canonicalize(&cfg.reference)
+            .with_context(|| format!("reference {}", cfg.reference.display()))?;
         tool_version(&cfg.minimap2)?;
         tool_version(&cfg.samtools)?;
         let index = ensure_index(&cfg)?;
@@ -192,6 +198,7 @@ impl Engine {
             all_reads.append(&mut loaded.reads);
         }
 
+        let started = Instant::now();
         self.cycle_counter += 1;
         let tag = format!("seg_{}_{:04}", now_unix(), self.cycle_counter);
         let out_dir = self.cfg.out_dir.clone();
@@ -253,6 +260,15 @@ impl Engine {
 
         self.state.files_done = self.ledger.len() as u64;
         self.state.cycles += 1;
+        log::info!(
+            "cycle {}: {} files, {} reads, {} passed the filter, {} primary records, aligned in {:.1}s",
+            self.cycle_counter,
+            batch.len(),
+            report.reads_seen,
+            report.reads_passed,
+            primary_in_cycle,
+            started.elapsed().as_secs_f64()
+        );
         report.files = batch.len();
         report.aligned = true;
         Ok(())
@@ -410,7 +426,7 @@ mod tests {
                 let contig = self.rng.below(2);
                 let len = 300 + self.rng.below(3500); // some too short, some too long
                 let start = self.rng.below(self.genome[contig].len() - len);
-                let seq = mutate(&mut self.rng, &self.genome[contig][start..start + len].to_vec(), 30);
+                let seq = mutate(&mut self.rng, &self.genome[contig][start..start + len], 30);
                 let qs = if self.rng.below(5) == 0 { 12.0 } else { 18.0 + self.rng.below(100) as f32 / 10.0 };
                 let barcode = Path::new(rel).components().find_map(|c| {
                     let s = c.as_os_str().to_string_lossy().to_string();
@@ -423,7 +439,7 @@ mod tests {
                 ).unwrap();
                 text.extend_from_slice(&seq);
                 text.extend_from_slice(b"\n+\n");
-                text.extend(std::iter::repeat(b'5').take(len));
+                text.extend(std::iter::repeat_n(b'5', len));
                 text.push(b'\n');
                 if qs >= 20.0 && (500..=3000).contains(&len) {
                     passing.push(name);

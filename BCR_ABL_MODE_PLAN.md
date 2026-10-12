@@ -127,6 +127,42 @@ and records them in provenance. No in-process aligner in this plan.
   the nagini thread).
 - Benchmark gate for the alignment-process choice above.
 
+#### Phase 1 status (2026-10-12): implemented in `crates/nanobcr-core`, CLI `nanostream bcr-abl watch|snapshot|replay`
+
+Done and verified:
+- Watcher (mtime + size stability, truncated gzip retried, `fastq_fail` optional), JSONL ledger
+  (resume after restart, torn last line tolerated), filter via the same
+  `fastq_record_passes` predicate as `nanostream filter`, one `minimap2 -a -x splice -y -Y --MD`
+  run per cycle with in-process per-barcode SAM split and counting, segments compacted
+  behind an atomic manifest, `state.json`, `provenance.json`, `replay`.
+- **Golden test on real data** (31,110 reads sampled from the real hg19 BCR-ABL barcode24 BAM,
+  written as a MinKNOW-style run, replayed live in 8 half-written chunks): the engine's BAM
+  (4 cycles, aligned against a `-x splice` `.mmi`) has **byte-identical records, every field and tag,
+  to `nanostream filter` + one `minimap2 -x splice` run on the FASTA** — 5,039 records, same md5.
+  The synthetic-genome version of this comparison runs in `cargo test`.
+- **Benchmark gate (hg19, 84 contigs, 3.1 GB FASTA): passed, with a memory cost.** Index build
+  35 s / 23 GB RSS (once); the splice `.mmi` is 11.6 GB; each cycle pays ~4 s index load + ~3 s
+  teardown with 14–18 GB peak RSS; alignment of unfiltered long reads (median 4.4 kb) ran ~150 reads/s
+  on 8 threads, so the filtered 0.5–3 kb amplicon reads are far cheaper. Per-batch invocation (option B)
+  is therefore fine and the persistent-process variant (A) is not needed. **The sequencing
+  computer needs >= ~24 GB free RAM** while a cycle runs; a smaller reference would cut this, but
+  restricting to chr9/chr22 would break equivalence with nagini (see option C).
+- nagini accepts the handoff: `prepare_nagini_inputs.py --input-type aligned_bam --barcode-map map.csv`
+  over a directory of `barcodeNN.bam` (+`.bai`) produced `units.tsv`/`samples.tsv` with
+  `input_type=aligned_bam`, `assay=bcr_abl`, `library_type=cdna`. So the Phase 4 handoff layout is
+  `<handoff>/barcodeNN.bam(.bai)` + a barcode map CSV (`barcode,sample,type,assay,library_type`).
+  (A full `snakemake` dry run was not possible here: the workstation hg19 paths do not exist on this Mac.)
+
+Known gaps / follow-ups:
+- Not yet run against a live MinKNOW run; only replay. Verify the stability rule against real file
+  rotation, and that MinKNOW's own `final_summary_*.txt` location matches `run_finished`.
+- A file modified after it was processed is not re-read (a warning is not yet logged).
+- A `.mmi` as `--reference` leaves no `.fai` fingerprint in `provenance.json`; pass the FASTA.
+- samtools truncates multi-word FASTQ comments to the first tag (`qs:f:` survives, `ch:i:`/`st:Z:` do
+  not); nagini's own path behaves the same, so this is equivalent, but those tags are not in the BAM.
+- Segment/compaction cost grows with run length (each compaction merges into the whole BAM); revisit
+  if multi-day runs make snapshots slow.
+
 ### Phase 2 — preliminary analysis
 
 - Snapshot job every ~10 min (configurable) per barcode.

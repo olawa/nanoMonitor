@@ -2259,6 +2259,7 @@ dependencies = [
  "chrono",
  "clap",
  "env_logger",
+ "nanobcr-core",
  "nanofilter-core",
  "nanoparse-core",
  "nanoseq-core",

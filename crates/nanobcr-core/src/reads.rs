@@ -121,7 +121,7 @@ mod tests {
     fn fastq_record(name: &str, comment: &str, len: usize, q: u8) -> String {
         format!(
             "@{name} {comment}\n{}\n+\n{}\n",
-            "ACGT".repeat(len / 4 + 1)[..len].to_string(),
+            &"ACGT".repeat(len / 4 + 1)[..len],
             (q as char).to_string().repeat(len)
         )
     }

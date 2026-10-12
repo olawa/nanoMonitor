@@ -136,6 +136,9 @@ pub enum Commands {
         #[arg(long, default_value = "400")]
         speed_bps: f64,
     },
+    /// BCR-ABL1 live mode: watch a MinKNOW run, filter, splice-align, keep per-barcode BAMs
+    #[command(subcommand, name = "bcr-abl")]
+    BcrAbl(BcrAblCommand),
     /// Filter reads by QV, length, channel, or time
     Filter(FilterArgs),
     /// Extract reads from a channel range
@@ -305,4 +308,85 @@ pub struct UmiArgs {
     pub size_tolerance: usize,
     #[arg(long)]
     pub summary: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum BcrAblCommand {
+    /// Watch a MinKNOW directory and keep sorted, indexed per-barcode BAMs up to date
+    Watch(BcrWatchArgs),
+    /// Fold every barcode's pending segments into its sorted, indexed BAM (engine need not be running)
+    Snapshot(BcrSnapshotArgs),
+    /// Feed a finished run into a directory the way MinKNOW would (for testing)
+    Replay(BcrReplayArgs),
+}
+
+#[derive(Parser, Clone)]
+pub struct BcrWatchArgs {
+    /// MinKNOW run directory (or its fastq_pass directory)
+    pub input: PathBuf,
+    /// Output directory (state.json, provenance.json, per-barcode BAMs)
+    #[arg(short, long)]
+    pub out: PathBuf,
+    /// Reference FASTA (indexed once with `-x splice`) or a prebuilt .mmi
+    #[arg(short, long)]
+    pub reference: PathBuf,
+    /// Minimum mean read quality (dorado qs)
+    #[arg(long, default_value_t = 20.0)]
+    pub qv: f64,
+    /// Read length range, MIN-MAX
+    #[arg(long, default_value = "500-3000")]
+    pub len: String,
+    /// Only read fastq_pass (nagini includes fastq_fail by default)
+    #[arg(long, default_value_t = false)]
+    pub pass_only: bool,
+    #[arg(short, long, default_value_t = 8)]
+    pub threads: usize,
+    /// A FASTQ is read once it has not changed for this many seconds
+    #[arg(long, default_value_t = 10)]
+    pub stable_secs: u64,
+    #[arg(long, default_value_t = 2)]
+    pub poll_secs: u64,
+    /// Minimum seconds between alignment cycles
+    #[arg(long, default_value_t = 20)]
+    pub cycle_secs: u64,
+    /// Seconds between compactions into sorted, indexed BAMs
+    #[arg(long, default_value_t = 600)]
+    pub snapshot_secs: u64,
+    /// Process what is there, compact, and exit
+    #[arg(long, default_value_t = false)]
+    pub once: bool,
+    #[arg(long, default_value = "minimap2")]
+    pub minimap2: String,
+    #[arg(long, default_value = "samtools")]
+    pub samtools: String,
+    /// Extra minimap2 arguments after the preset (space separated)
+    #[arg(long, default_value = "-y -Y --MD")]
+    pub minimap2_extra: String,
+}
+
+#[derive(Parser, Clone)]
+pub struct BcrSnapshotArgs {
+    /// Engine output directory
+    pub out: PathBuf,
+    #[arg(short, long, default_value_t = 8)]
+    pub threads: usize,
+    #[arg(long, default_value = "samtools")]
+    pub samtools: String,
+}
+
+#[derive(Parser, Clone)]
+pub struct BcrReplayArgs {
+    /// Finished run directory to replay
+    pub src: PathBuf,
+    /// Directory to write into (point `bcr-abl watch` at it)
+    pub dest: PathBuf,
+    /// Seconds between files
+    #[arg(long, default_value_t = 4.0)]
+    pub interval: f64,
+    /// Expose each file half-written for a moment
+    #[arg(long, default_value_t = false)]
+    pub partial: bool,
+    /// Write final_summary_replay.txt at the end, as MinKNOW does
+    #[arg(long, default_value_t = false)]
+    pub finish: bool,
 }

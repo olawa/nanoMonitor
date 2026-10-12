@@ -177,3 +177,27 @@ impl Store {
         }))
     }
 }
+
+/// Compact every barcode store under `out_dir` (the engine need not be running).
+/// Returns barcode -> current sorted, indexed BAM.
+pub fn compact_out_dir(
+    out_dir: &Path,
+    samtools: &str,
+    threads: usize,
+) -> Result<std::collections::BTreeMap<String, PathBuf>> {
+    let mut bams = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(out_dir)?.flatten() {
+        let dir = entry.path();
+        if !dir.join("inbox").is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let store = Store::new(&dir);
+        store.recover()?;
+        store.compact(samtools, threads)?;
+        if let Some(bam) = store.current_bam() {
+            bams.insert(name, bam);
+        }
+    }
+    Ok(bams)
+}

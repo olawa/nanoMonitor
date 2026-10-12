@@ -12,6 +12,7 @@ env_logger = "0.11"
 nanofilter-core = { path = "../nanofilter-core" }
 nanoparse-core = { path = "../nanoparse-core" }
 nanoseq-core = { path = "../nanoseq-core" }
+nanobcr-core = { path = "../nanobcr-core" }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 

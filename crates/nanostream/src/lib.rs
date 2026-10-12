@@ -187,6 +187,48 @@ pub fn run_make_pe(args: cli::MakePeArgs) -> Result<()> {
     Ok(())
 }
 
+pub fn run_bcr_abl(cmd: cli::BcrAblCommand) -> Result<()> {
+    use nanobcr_core::{replay, store, Engine, EngineConfig};
+    use std::sync::atomic::AtomicBool;
+
+    match cmd {
+        cli::BcrAblCommand::Watch(a) => {
+            let (min_len, max_len) = parse_len_args(&[a.len.clone()])?;
+            let mut cfg = EngineConfig::new(a.input, a.out, a.reference);
+            cfg.min_qv = a.qv;
+            cfg.min_len = min_len;
+            cfg.max_len = max_len;
+            cfg.include_fail = !a.pass_only;
+            cfg.threads = a.threads;
+            cfg.stable_secs = a.stable_secs;
+            cfg.poll_secs = a.poll_secs;
+            cfg.min_cycle_secs = a.cycle_secs;
+            cfg.snapshot_secs = a.snapshot_secs;
+            cfg.once = a.once;
+            cfg.minimap2 = a.minimap2;
+            cfg.samtools = a.samtools;
+            cfg.minimap2_extra = a.minimap2_extra.split_whitespace().map(String::from).collect();
+            let mut engine = Engine::new(cfg)?;
+            engine.run(&AtomicBool::new(false))
+        }
+        cli::BcrAblCommand::Snapshot(a) => {
+            for (barcode, bam) in store::compact_out_dir(&a.out, &a.samtools, a.threads)? {
+                println!("{barcode}\t{}", bam.display());
+            }
+            Ok(())
+        }
+        cli::BcrAblCommand::Replay(a) => {
+            let mut cfg = replay::ReplayConfig::new(a.src, a.dest);
+            cfg.interval_secs = a.interval;
+            cfg.partial = a.partial;
+            cfg.finish_marker = a.finish;
+            let n = replay::replay(&cfg, &AtomicBool::new(false))?;
+            eprintln!("replayed {n} files");
+            Ok(())
+        }
+    }
+}
+
 pub fn run_discover(args: cli::DiscoverArgs) -> Result<()> {
     let input_str = args.input.to_string_lossy().to_lowercase();
     if input_str.ends_with(".bam") {

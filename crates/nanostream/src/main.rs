@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use nanostream_lib::{cli, run_discover, run_extract, run_filter, run_make_pe, run_split, run_umi};
+use nanostream_lib::{cli, run_bcr_abl, run_discover, run_extract, run_filter, run_make_pe, run_split, run_umi};
 use nanoparse_core::{enrichment, matcher, pore_stats, stats};
 
 fn main() -> Result<()> {
@@ -104,6 +104,7 @@ fn main() -> Result<()> {
                 speed_bps,
             )?;
         }
+        cli::Commands::BcrAbl(cmd) => run_bcr_abl(cmd)?,
         cli::Commands::Filter(args) => run_filter(args)?,
         cli::Commands::Extract(args) => run_extract(args)?,
         cli::Commands::Split(args) => run_split(args)?,
