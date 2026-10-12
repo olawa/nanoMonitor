@@ -244,3 +244,137 @@ impl DashboardData {
         self.accuracy_mode = find_mode(&self.accuracy_bins);
     }
 }
+
+impl DashboardData {
+    /// Replace the analysis numbers while keeping what the user did on top of
+    /// them: the selected amplicon (by name, since rows re-sort), the variants
+    /// and the snapshot image. Every progress tick used to wipe these.
+    pub fn replace_keeping_ui_state(&mut self, mut new: DashboardData) {
+        let selected = self
+            .selected_row
+            .and_then(|i| self.rows.get(i))
+            .map(|r| r.amplicon_name.clone());
+        new.selected_row =
+            selected.and_then(|name| new.rows.iter().position(|r| r.amplicon_name == name));
+        new.variants = std::mem::take(&mut self.variants);
+        new.snapshot_img_path = self.snapshot_img_path.take();
+        *self = new;
+    }
+}
+
+/// Statistics of the files already finished in a directory-monitoring run.
+///
+/// The dashboard shows `base + the file being analysed`. Progress ticks used to
+/// overwrite the dashboard and the final result was then merged into that same
+/// partial view, so the display ended up at roughly twice the latest file and
+/// every earlier file was lost.
+#[derive(Default)]
+pub struct RunAccumulator {
+    base: Option<DashboardData>,
+}
+
+impl RunAccumulator {
+    pub fn reset(&mut self) {
+        self.base = None;
+    }
+
+    /// What to show while a file is still being analysed.
+    pub fn with_live(&self, live: DashboardData, accumulate: bool) -> DashboardData {
+        match (&self.base, accumulate) {
+            (Some(base), true) => {
+                let mut shown = base.clone();
+                shown.merge(live);
+                shown
+            }
+            _ => live,
+        }
+    }
+
+    /// Fold a finished file in and return the new totals to show.
+    pub fn complete(&mut self, finished: DashboardData, accumulate: bool) -> DashboardData {
+        if !accumulate {
+            self.base = None;
+            return finished;
+        }
+        let mut totals = self.base.take().unwrap_or_else(DashboardData::empty);
+        totals.merge(finished);
+        self.base = Some(totals.clone());
+        totals
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data(reads: u64, amplicon: &str, count: u32) -> DashboardData {
+        let mut d = DashboardData::empty();
+        d.total_reads = reads;
+        d.rows.push(ResultRow {
+            amplicon_name: amplicon.into(),
+            count,
+            median_length: 1000,
+            sd_length: 10.0,
+            avg_qs: 20.0,
+            variants: 0,
+        });
+        d
+    }
+
+    #[test]
+    fn progress_on_top_of_finished_files_is_not_double_counted() {
+        let mut acc = RunAccumulator::default();
+        let after_first = acc.complete(data(100, "A", 80), true);
+        assert_eq!(after_first.total_reads, 100);
+
+        // Second file is half done: 50 reads so far.
+        let shown = acc.with_live(data(50, "A", 40), true);
+        assert_eq!(shown.total_reads, 150);
+        assert_eq!(shown.rows[0].count, 120);
+
+        // It finishes with 100 reads; the earlier progress ticks must not count.
+        let totals = acc.complete(data(100, "A", 80), true);
+        assert_eq!(totals.total_reads, 200);
+        assert_eq!(totals.rows[0].count, 160);
+        assert_eq!(totals.accumulated_files, 2);
+    }
+
+    #[test]
+    fn single_file_mode_never_accumulates() {
+        let mut acc = RunAccumulator::default();
+        acc.complete(data(100, "A", 80), false);
+        let totals = acc.complete(data(30, "A", 20), false);
+        assert_eq!(totals.total_reads, 30);
+    }
+
+    #[test]
+    fn ui_state_survives_a_data_refresh() {
+        let mut shown = data(10, "B", 5);
+        shown.rows.push(ResultRow {
+            amplicon_name: "A".into(),
+            count: 1,
+            median_length: 1,
+            sd_length: 0.0,
+            avg_qs: 1.0,
+            variants: 0,
+        });
+        shown.selected_row = Some(1); // "A"
+        shown.snapshot_img_path = Some("snap.png".into());
+
+        // The refreshed data sorts "A" first.
+        let mut fresh = data(20, "A", 9);
+        fresh.rows.push(ResultRow {
+            amplicon_name: "B".into(),
+            count: 5,
+            median_length: 1,
+            sd_length: 0.0,
+            avg_qs: 1.0,
+            variants: 0,
+        });
+        shown.replace_keeping_ui_state(fresh);
+
+        assert_eq!(shown.total_reads, 20);
+        assert_eq!(shown.selected_row, Some(0));
+        assert_eq!(shown.snapshot_img_path.as_deref(), Some("snap.png"));
+    }
+}

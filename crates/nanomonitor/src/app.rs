@@ -1,7 +1,7 @@
 use crate::integrations::{self, ClinicalMutation};
 use crate::model::{
-    AnalysisMode, DashboardData, FilterConfig, HistogramBin, MainTab, ResultRow, RunConfig,
-    RunSource, ThemeSkin, VariantRow,
+    AnalysisMode, DashboardData, FilterConfig, HistogramBin, MainTab, ResultRow, RunAccumulator,
+    RunConfig, RunSource, ThemeSkin, VariantRow,
 };
 use crate::nanostream_cli::NanostreamConfig;
 use crate::remote::{self, MonitorEvent, MonitorRequest, RemoteConfig, RemoteStatus};
@@ -77,7 +77,12 @@ pub struct NanoMonitorApp {
     data: DashboardData,
     log_lines: Vec<String>,
     run_state: RunState,
-    worker_rx: Option<Receiver<WorkerMessage>>,
+    // One channel for the whole session: analysis, snapshot and variant workers all
+    // send on clones of `worker_tx`. Creating a fresh channel per task used to drop
+    // the analysis receiver, so a running analysis never reported completion.
+    worker_tx: Sender<WorkerMessage>,
+    worker_rx: Receiver<WorkerMessage>,
+    accumulator: RunAccumulator,
     monitor_rx: Option<Receiver<MonitorMessage>>,
     monitor_stop_tx: Option<Sender<()>>,
     monitor_active: bool,
@@ -411,7 +416,7 @@ impl NanoMonitorApp {
             return;
         }
 
-        let (tx, rx) = mpsc::channel::<WorkerMessage>();
+        let tx = self.worker_tx.clone();
         let command_line = self
             .nanostream
             .build_amplicon_command(
@@ -425,7 +430,6 @@ impl NanoMonitorApp {
             .push(format!("Running in-process analysis for {}", input_path));
         self.log_lines
             .push(format!("CLI preview> {}", command_line));
-        self.worker_rx = Some(rx);
         self.run_state = RunState::Running;
         self.current_input = Some(input_path.clone());
         let primers_path = self.nanostream.primers_path.clone();
@@ -508,7 +512,7 @@ impl NanoMonitorApp {
         
         // We can spawn a quick thread sending results back to worker channel if mapped, or log it.
         // Let's create a dynamic channel.
-        let worker_tx = self.create_worker_sender_if_none();
+        let worker_tx = self.worker_sender();
 
         let rs_qc_bin = self.tool_rs_qc.clone();
         let gtf = self.gtf_path.clone();
@@ -558,7 +562,7 @@ impl NanoMonitorApp {
         self.variant_calling_running = true;
         self.log_lines.push(format!("Queued rindels variant calling for: {}", region));
 
-        let worker_tx = self.create_worker_sender_if_none();
+        let worker_tx = self.worker_sender();
         
         let rindels_bin = self.tool_rindels.clone();
         let reference = self.reference_path.clone();
@@ -609,11 +613,8 @@ impl NanoMonitorApp {
         });
     }
 
-    fn create_worker_sender_if_none(&mut self) -> Sender<WorkerMessage> {
-        let (tx, rx) = mpsc::channel::<WorkerMessage>();
-        // Add rx to worker channel checks
-        self.worker_rx = Some(rx);
-        tx
+    fn worker_sender(&self) -> Sender<WorkerMessage> {
+        self.worker_tx.clone()
     }
 
     fn pick_input_file(&mut self) {
@@ -624,6 +625,7 @@ impl NanoMonitorApp {
             self.run.source = RunSource::SingleFile;
             self.run.input_path = path.to_string_lossy().to_string();
             self.data = DashboardData::empty();
+            self.accumulator.reset();
             self.processed_files.clear();
             self.failed_files.clear();
             self.pending_files.clear();
@@ -869,6 +871,7 @@ impl NanoMonitorApp {
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>, startup: AppStartupConfig) -> Self {
+        let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>();
         // Bio-Teal (Dark) is the default stunning aesthetic
         let default_theme = ThemeSkin::BioTeal;
 
@@ -888,7 +891,9 @@ impl NanoMonitorApp {
                 "Select data inputs and press Start Monitor.".into(),
             ],
             run_state: RunState::Idle,
-            worker_rx: None,
+            worker_tx,
+            worker_rx,
+            accumulator: RunAccumulator::default(),
             monitor_rx: None,
             monitor_stop_tx: None,
             monitor_active: false,
@@ -964,6 +969,7 @@ impl NanoMonitorApp {
         }
         self.last_error = None;
         self.data = DashboardData::empty();
+        self.accumulator.reset();
         self.pending_files.clear();
         self.queued_files.clear();
         self.processed_files.clear();
@@ -1088,10 +1094,8 @@ impl NanoMonitorApp {
         let mut completed_ok = false;
         
         let mut worker_msgs = Vec::new();
-        if let Some(rx) = &self.worker_rx {
-            while let Ok(msg) = rx.try_recv() {
-                worker_msgs.push(msg);
-            }
+        while let Ok(msg) = self.worker_rx.try_recv() {
+            worker_msgs.push(msg);
         }
         for msg in worker_msgs {
             match msg {
@@ -1101,8 +1105,9 @@ impl NanoMonitorApp {
                     }
                 }
                 WorkerMessage::Progress { input_path, processed_reads: _, current_data } => {
-                    self.data = current_data;
-                    self.data.accumulated_files = 1;
+                    let accumulate = self.run.source == RunSource::MonitorDirectory;
+                    let shown = self.accumulator.with_live(current_data, accumulate);
+                    self.data.replace_keeping_ui_state(shown);
                     self.current_input = Some(input_path);
                 }
                 WorkerMessage::Completed { input_path, result } => {
@@ -1115,14 +1120,11 @@ impl NanoMonitorApp {
                             self.last_error = None;
                             self.log_lines.push(format!("Analysis complete: {}", input_path));
                             
-                            // Dynamic stats aggregation for live watch mode
-                            if self.run.source == RunSource::MonitorDirectory && self.data.accumulated_files > 0 {
-                                self.log_lines.push("Merging statistics with existing run data".into());
-                                self.data.merge(new_data);
-                            } else {
-                                self.data = new_data;
-                                self.data.accumulated_files = 1;
-                            }
+                            // In directory-monitoring mode the finished file is folded into
+                            // the running totals; otherwise it replaces the view.
+                            let accumulate = self.run.source == RunSource::MonitorDirectory;
+                            let totals = self.accumulator.complete(new_data, accumulate);
+                            self.data.replace_keeping_ui_state(totals);
 
                             if self.run.auto_scan_variants {
                                 self.log_lines.push("Auto-variant calling sequence queued".into());
@@ -1163,7 +1165,6 @@ impl NanoMonitorApp {
             }
         }
         if completed {
-            self.worker_rx = None;
             self.current_input = None;
             if let Some(path) = completed_path {
                 if completed_ok {
@@ -1314,6 +1315,7 @@ impl NanoMonitorApp {
                         if ui.text_edit_singleline(&mut self.run.input_path).changed() {
                             if self.run.input_path != prev_path {
                                 self.data = DashboardData::empty();
+                                self.accumulator.reset();
                                 self.processed_files.clear();
                                 self.failed_files.clear();
                                 self.pending_files.clear();
