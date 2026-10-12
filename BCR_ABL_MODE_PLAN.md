@@ -224,6 +224,36 @@ interval is not much shorter than that. The GUI should show "analysing generatio
   for filtered read length/qs.
 - Engine control: start/stop/attach to a running engine via `state.json` + a pid/lock file.
 
+#### Phase 3 status (2026-10-12): implemented as `nanomonitor --mode bcr-abl`
+
+A separate egui app (`crates/nanomonitor/src/bcr/`), launched with
+`nanomonitor --mode bcr-abl [--monitor-dir RUN] [--bcr-out OUT] [--reference REF] [--nagini DIR]`;
+the amplicon mode is untouched. The GUI never talks to the engine: it reads `state.json`,
+`<barcode>/prelim/summary.json` and `history.jsonl` every 1.5 s (all replaced atomically by their writers),
+so the same window can watch an engine started from a terminal, over ssh, or earlier.
+- **Setup panel:** run folder, output folder, reference, nagini checkout, advanced (python, FASTA, nanostream
+  path, build, qs/length, threads, snapshot interval, pass-only). "Check setup" runs
+  `nanobcr_core::preflight` (new: MinKNOW folder and FASTQ count, minimap2/samtools versions, reference and
+  `.fai`/index, RAM against the measured per-cycle need, writable output folder and free disk, a previous run
+  that will be resumed, nagini scripts and pysam). Start is refused on any failed check, and re-checked at start.
+- **Engine control:** Start spawns `nanostream bcr-abl watch ...` (binary: configured, else next to the app,
+  else PATH) with its log in `<out>/engine.log`; it outlives the window. "Stop (clean)" creates `STOP` so the
+  engine finishes its cycle, compacts and exits; "Force stop" only kills a process this window started.
+  A second engine on the same folder is refused (fresh heartbeat + live pid).
+- **Samples tab:** per barcode: files, reads, passed filter, mapped, supplementary, age of last data, snapshot
+  generation, analysis status, fusion call, kinase mutations with VAF, "enough data?".
+  **Sample detail:** fusion isoform table with fractions and a warning when the leading isoform changed
+  between snapshots; mutation table with VAF/depth/status and the six TKI classes coloured; phasing pairs;
+  depth over the 73 sites and the sufficiency verdict; plots of VAF and fusion reads against reads passed.
+  **Engine log** tab. Staleness: no heartbeat for 120 s shows "Engine NOT RESPONDING" in red.
+- Tests: data loading and liveness, argument building, process start/stop with a fake binary, and headless egui
+  frames of every tab on realistic data, empty/missing directories and a corrupt `summary.json`.
+
+Not verified: how it looks. This environment cannot capture the screen, so the GUI was launched on the real
+engine output (it ran without crashing) and rendered headlessly in tests, but not seen. Per-exon depth is not
+shown (that script is not run live); image loaders for `fusion_plot.png` are deferred to Phase 4, where the plot
+exists, using the `image` crate already in the lockfile rather than `egui_extras` (no 0.29 build is cached).
+
 ### Phase 4 — start full pipeline and show results
 
 - "Run nagini" button: final snapshot -> merge segments -> `alignment/barcodeXX.bam` + `.bai` ->

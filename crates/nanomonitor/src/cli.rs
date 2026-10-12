@@ -3,6 +3,8 @@ use clap::{Parser, ValueEnum};
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum CliMode {
     Amplicon,
+    /// BCR-ABL1 live mode: watch a MinKNOW run, align, preliminary analysis
+    BcrAbl,
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -35,6 +37,14 @@ pub struct NanoMonitorCli {
     /// nanostream executable path
     #[arg(long = "nanostream-bin")]
     pub nanostream_bin: Option<String>,
+
+    /// BCR-ABL mode: engine output folder
+    #[arg(long = "bcr-out")]
+    pub bcr_out: Option<String>,
+
+    /// BCR-ABL mode: nagini checkout for the preliminary analysis
+    #[arg(long)]
+    pub nagini: Option<String>,
 
     /// Start analysis immediately on launch
     #[arg(long)]

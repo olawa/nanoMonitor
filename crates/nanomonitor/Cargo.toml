@@ -14,3 +14,7 @@ anyhow = "1"
 nanoparse-core = { path = "../nanoparse-core" }
 nanofilter-core = { path = "../nanofilter-core" }
 nanoseq-core = { path = "../nanoseq-core" }
+nanobcr-core = { path = "../nanobcr-core" }
+
+[dev-dependencies]
+tempfile = "3"

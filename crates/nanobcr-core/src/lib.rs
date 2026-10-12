@@ -10,6 +10,7 @@ pub mod align;
 pub mod config;
 pub mod engine;
 pub mod ledger;
+pub mod preflight;
 pub mod prelim;
 pub mod reads;
 pub mod replay;

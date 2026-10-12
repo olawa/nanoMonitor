@@ -2207,12 +2207,14 @@ dependencies = [
  "clap",
  "eframe",
  "egui_plot",
+ "nanobcr-core",
  "nanofilter-core",
  "nanoparse-core",
  "nanoseq-core",
  "rfd",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
