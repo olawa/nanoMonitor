@@ -588,6 +588,11 @@ fn read_bam_timings(
 
     for result in bam.records() {
         let record = result.context("Failed to read BAM record")?;
+        // A split read's other alignments carry the same channel and start time:
+        // counting them would invent zero-length gaps between "reads".
+        if record.is_secondary() || record.is_supplementary() {
+            continue;
+        }
         total_reads += 1;
 
         let read_id = String::from_utf8_lossy(record.qname()).to_string();

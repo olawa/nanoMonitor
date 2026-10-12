@@ -18,7 +18,9 @@ use std::collections::{HashMap, VecDeque};
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use triple_accel::levenshtein::levenshtein_simd_k;
+use triple_accel::levenshtein::{levenshtein_search_simd_with_opts, levenshtein_simd_k};
+use triple_accel::levenshtein::LEVENSHTEIN_COSTS;
+use triple_accel::SearchType;
 
 use crate::output::write_output;
 use crate::primers::{load_primers, KmerIndex, Primer};
@@ -141,40 +143,36 @@ struct PendingUnassigned {
     res: MatchResult,
 }
 
-/// Semi-global alignment with early exit optimization using triple_accel
+/// Best edit distance (<= `max_dist`) of `pattern` anywhere in `text`, or `None`.
+///
+/// This is a semi-global search: the whole primer is aligned, the read is not. It
+/// used to compare the primer globally against fixed windows of length
+/// `len + max_dist`, so the best possible score was already `max_dist` and a
+/// primer with a single error was rejected -- `--max-edit-dist 3` behaved like 0.
 fn semi_global_align(pattern: &[u8], text: &[u8], max_dist: usize) -> Option<u32> {
     if pattern.is_empty() || text.is_empty() {
         return None;
     }
+    levenshtein_search_simd_with_opts(
+        pattern,
+        text,
+        max_dist as u32,
+        SearchType::Best,
+        LEVENSHTEIN_COSTS,
+        false,
+    )
+    .map(|m| m.k)
+    .min()
+}
 
-    let pattern_len = pattern.len();
-    let mut best_dist: Option<u32> = None;
-
-    let max_start = if text.len() > pattern_len {
-        text.len() - pattern_len + max_dist
-    } else {
-        max_dist
-    };
-
-    for start in 0..=max_start.min(text.len().saturating_sub(1)) {
-        let end = (start + pattern_len + max_dist).min(text.len());
-        if end <= start {
-            continue;
-        }
-
-        let text_slice = &text[start..end];
-
-        if let Some(dist) = levenshtein_simd_k(pattern, text_slice, max_dist as u32) {
-            if dist == 0 {
-                return Some(0); // Perfect match - early exit
-            }
-            if best_dist.is_none() || dist < best_dist.unwrap() {
-                best_dist = Some(dist);
-            }
-        }
-    }
-
-    best_dist
+/// k-mer size for the primer prefilter, small enough that it cannot lose a primer that
+/// is within `max_edit_dist` edits. A primer cut into `max_edit_dist + 1` pieces has at
+/// least one piece without an error (pigeonhole), so any k no larger than the shortest
+/// piece still leaves that piece's k-mers intact in the read. A fixed k = 8 dropped a
+/// 22 bp primer with three spread-out errors before it was ever aligned.
+fn prefilter_kmer_size(primers: &[Primer], max_edit_dist: usize) -> usize {
+    let shortest = primers.iter().map(|p| p.sequence.len()).min().unwrap_or(0);
+    (shortest / (max_edit_dist + 1)).clamp(4, 8)
 }
 
 /// Semi-global alignment returning the start index in `text` and edit distance
@@ -309,6 +307,7 @@ fn split_chimera_fastq_read(
 
 fn match_read_sequence(
     record: &bam::Record,
+    target_names: &[String],
     read_index: usize,
     primers: &[Primer],
     kmer_index: Option<&KmerIndex>,
@@ -323,16 +322,11 @@ fn match_read_sequence(
     let length = full_seq_bytes.len();
     let quality = qv_from_record(record);
 
-    let tid = record.tid();
+    // The contig's name (not its index in the header) and where the alignment really
+    // ends on the reference: soft-clipped bases are part of the read, not of the locus.
     let start = record.pos();
-    let end = record.pos() + record.seq_len() as i64;
-
-    // Keep chromosome id as numeric tid string to avoid header pointer issues.
-    let chrom_name = if tid >= 0 {
-        Some(tid.to_string())
-    } else {
-        None
-    };
+    let end = reference_end(record);
+    let chrom_name = contig_name(record, target_names);
     let chrom = chrom_name.clone(); // Keep original clone for result
 
     let extract_len = std::cmp::min(length, end_length);
@@ -350,97 +344,54 @@ fn match_read_sequence(
     // ---------------------
 
     // FAST PATH: Check Coordinates Coverage
-    // If we have mapped coordinates and they match a primer region, we can skip expensive alignment.
+    // If the alignment sits on primer regions at both ends the pair is known without
+    // alignment. A hit at one end alone says little (a fusion read starts on one
+    // chromosome and ends on another, and separate forward/reverse primer entries
+    // are on different ones), so it is discarded and the sequence decides.
     if primer_tolerance > 0 {
         if let Some(ref c) = chrom {
             let r_c_norm = c.replace("chr", "");
-
-            // Check all primers for start/end match
-            // We need to iterate primers.
-            // Note: 'primers' slice contains individual primers, usually Fwd and Rev.
-            // If a primer has coordinates, we check them.
-
+            let mut coord_start: Option<&str> = None;
+            let mut coord_end: Option<&str> = None;
             for primer in primers {
                 if let (Some(p_c), Some(p_start), Some(p_end)) =
                     (&primer.chrom, primer.start, primer.end)
                 {
-                    let p_c_norm = p_c.replace("chr", "");
-                    if r_c_norm == p_c_norm {
-                        // Check Start
-                        let d_start = (start - p_start).abs();
-                        let d_end = (end - p_end).abs();
-
-                        // If this primer matches the START of the read
-                        if d_start <= primer_tolerance {
-                            // This is a candidate for start primer
-                            // If we assume perfect coordinate trust, we can set it and break.
-                            best_start_primer = Some(&primer.name);
-                            best_start_dist = 0; // "Perfect" match by coords
+                    if r_c_norm == p_c.replace("chr", "") {
+                        if (start - p_start).abs() <= primer_tolerance {
+                            coord_start = Some(&primer.name);
                         }
-
-                        // If this primer matches the END of the read
-                        if d_end <= primer_tolerance {
-                            best_end_primer = Some(&primer.name);
-                            best_end_dist = 0;
+                        if (end - p_end).abs() <= primer_tolerance {
+                            coord_end = Some(&primer.name);
                         }
                     }
                 }
             }
 
-            // If we found both by coordinates, we can return early!
-            // Note: This logic assumes individual primers have start/end.
-            // If the primers file defines Amplicons as "PrimerA:chr:start-end"
-            // Then usually PrimerA covers the whole region.
-            // But if we defined Fwd and Rev primers separately with coord...
-            // The current `primers.rs` loads each line as a Primer.
-            // If the user provided "AmpliconName -> Sequence -> Region",
-            // Then we have 1 Primer struct per line.
-            // If that struct has start/end, and read matches BOTH start/end to this single struct,
-            // then this single struct represents the whole amplicon.
-            // This is the common case for the TSV format "AmpliconID Seq Region".
-
-            if let (Some(s), Some(e)) = (best_start_primer, best_end_primer) {
-                if s == e {
-                    // Single amplicon entry covers both ends (Standard Amplicon definition)
-                    return MatchResult {
-                        read_id_index: read_index,
-                        amplicon_name: Some(s.to_string()),
-                        start_primer: Some(s.to_string()),
-                        end_primer: Some(e.to_string()), // Same name
-                        start_dist: 0,
-                        end_dist: 0,
-                        length: length,
-                        quality,
-                        chrom: chrom.clone(),
-                        start: Some(start),
-                        end: Some(end),
-                        is_chimera: false,
-                    };
+            if let (Some(s), Some(e)) = (coord_start, coord_end) {
+                // One entry covering both ends is the standard "amplicon by region"
+                // definition; two entries are a forward/reverse pair.
+                let name = if s == e {
+                    s.to_string()
+                } else if s < e {
+                    format!("{}-{}", s, e)
                 } else {
-                    // Distinct primers matched (Forward and Reverse defined separately?)
-                    // If so, combine them.
-                    // But typically `nanoparse` expects to find pairs.
-                    // If we found a pair by coords, proceed.
-                    let name = if s < e {
-                        format!("{}-{}", s, e)
-                    } else {
-                        format!("{}-{}", e, s)
-                    };
-                    return MatchResult {
-                        read_id_index: read_index,
-                        amplicon_name: Some(name),
-                        start_primer: Some(s.to_string()),
-                        end_primer: Some(e.to_string()),
-                        start_dist: 0,
-                        end_dist: 0,
-                        length: length,
-                        quality,
-                        chrom: chrom.clone(),
-                        start: Some(start),
-                        end: Some(end),
-                        is_chimera: false,
-                    };
-                }
+                    format!("{}-{}", e, s)
+                };
+                return MatchResult {
+                    read_id_index: read_index,
+                    amplicon_name: Some(name),
+                    start_primer: Some(s.to_string()),
+                    end_primer: Some(e.to_string()),
+                    start_dist: 0,
+                    end_dist: 0,
+                    length,
+                    quality,
+                    chrom: chrom.clone(),
+                    start: Some(start),
+                    end: Some(end),
+                    is_chimera: false,
+                };
             }
         }
     }
@@ -448,7 +399,7 @@ fn match_read_sequence(
     // SEQUENCE MATCHING (Original Logic)
     if let Some(idx) = kmer_index {
         let start_str = unsafe { std::str::from_utf8_unchecked(start_bytes) };
-        let candidates = idx.find_candidates(start_str, 0.1);
+        let candidates = idx.find_candidates(start_str, 0.0);
 
         // Fallback to all primers if candidates empty? No, rely on index.
         for &p_idx in &candidates {
@@ -484,7 +435,7 @@ fn match_read_sequence(
     // ----------------------------------------
     if let Some(idx) = kmer_index {
         let end_str = unsafe { std::str::from_utf8_unchecked(end_bytes) };
-        let candidates = idx.find_candidates(end_str, 0.1);
+        let candidates = idx.find_candidates(end_str, 0.0);
 
         for &p_idx in &candidates {
             let primer = &primers[p_idx];
@@ -589,38 +540,58 @@ fn match_read_sequence(
     }
 }
 
-/// Match using mapping coordinates
-fn match_read_coords(record: &bam::Record, index: usize) -> MatchResult {
+/// The contig a record is aligned to, by name.
+fn reverse_complement_bytes(seq: &[u8]) -> Vec<u8> {
+    seq.iter()
+        .rev()
+        .map(|&b| match b {
+            b'A' => b'T',
+            b'T' => b'A',
+            b'C' => b'G',
+            b'G' => b'C',
+            b'a' => b't',
+            b't' => b'a',
+            b'c' => b'g',
+            b'g' => b'c',
+            other => other,
+        })
+        .collect()
+}
+
+/// The contig a record is aligned to, by name.
+fn contig_name(record: &bam::Record, target_names: &[String]) -> Option<String> {
+    let tid = record.tid();
+    if tid < 0 {
+        return None;
+    }
+    target_names.get(tid as usize).cloned()
+}
+
+/// Reference coordinate just past the last aligned base (`pos` for an unmapped record).
+fn reference_end(record: &bam::Record) -> i64 {
+    if record.is_unmapped() || record.cigar_len() == 0 {
+        return record.pos();
+    }
+    record.cigar().end_pos()
+}
+
+/// Match using mapping coordinates: the read belongs to the primer entry whose region
+/// its alignment starts and ends on (within `primer_tolerance`).
+///
+/// If no primer entry has a region at all there is nothing to match against, and the
+/// read is named by its own position, as before (one "amplicon" per distinct locus).
+fn match_read_coords(
+    record: &bam::Record,
+    target_names: &[String],
+    index: usize,
+    primers: &[Primer],
+    primer_tolerance: i64,
+) -> MatchResult {
     let length = record.seq_len();
     let quality = qv_from_record(record);
-
-    if record.is_unmapped() {
-        return MatchResult {
-            read_id_index: index,
-            amplicon_name: None,
-            start_primer: None,
-            end_primer: None,
-            start_dist: 0,
-            end_dist: 0,
-            is_chimera: false,
-            length,
-            quality,
-            chrom: None,
-            start: None,
-            end: None,
-        };
-    }
-
-    let chrom = format!("{}", record.tid());
-    let start = record.pos();
-    let end = record.pos() + record.seq_len() as i64;
-
-    // For now, use position-based naming as placeholder
-    let amplicon_name = Some(format!("{}:{}-{}", chrom, start, end));
-
-    MatchResult {
+    let unassigned = |chrom: Option<String>, start: Option<i64>, end: Option<i64>| MatchResult {
         read_id_index: index,
-        amplicon_name,
+        amplicon_name: None,
         start_primer: None,
         end_primer: None,
         start_dist: 0,
@@ -628,9 +599,38 @@ fn match_read_coords(record: &bam::Record, index: usize) -> MatchResult {
         is_chimera: false,
         length,
         quality,
-        chrom: Some(chrom),
-        start: Some(start),
-        end: Some(end),
+        chrom,
+        start,
+        end,
+    };
+
+    let Some(chrom) = contig_name(record, target_names).filter(|_| !record.is_unmapped()) else {
+        return unassigned(None, None, None);
+    };
+    let start = record.pos();
+    let end = reference_end(record);
+
+    let amplicon_name = if primers.iter().any(|p| p.chrom.is_some() && p.start.is_some()) {
+        let c = chrom.replace("chr", "");
+        let mut best: Option<(i64, &str)> = None;
+        for p in primers {
+            if let (Some(pc), Some(ps), Some(pe)) = (&p.chrom, p.start, p.end) {
+                if pc.replace("chr", "") == c {
+                    let (ds, de) = ((start - ps).abs(), (end - pe).abs());
+                    if ds <= primer_tolerance && de <= primer_tolerance && best.map(|(d, _)| ds + de < d).unwrap_or(true) {
+                        best = Some((ds + de, &p.name));
+                    }
+                }
+            }
+        }
+        best.map(|(_, n)| n.to_string())
+    } else {
+        Some(format!("{}:{}-{}", chrom, start, end))
+    };
+
+    MatchResult {
+        amplicon_name,
+        ..unassigned(Some(chrom), Some(start), Some(end))
     }
 }
 
@@ -660,7 +660,7 @@ fn match_fastq_read(
 
     if let Some(idx) = kmer_index {
         let start_str = unsafe { std::str::from_utf8_unchecked(start_bytes) };
-        let candidates = idx.find_candidates(start_str, 0.1);
+        let candidates = idx.find_candidates(start_str, 0.0);
         for &p_idx in &candidates {
             let primer = &primers[p_idx];
             let primer_bytes = primer.sequence.as_bytes();
@@ -691,7 +691,7 @@ fn match_fastq_read(
 
     if let Some(idx) = kmer_index {
         let end_str = unsafe { std::str::from_utf8_unchecked(end_bytes) };
-        let candidates = idx.find_candidates(end_str, 0.1);
+        let candidates = idx.find_candidates(end_str, 0.0);
         for &p_idx in &candidates {
             let primer = &primers[p_idx];
             let primer_rc_bytes = primer.sequence_rc.as_bytes();
@@ -853,14 +853,61 @@ fn build_distributions_from_values(lengths: &[f64], qs_vals: &[f64]) -> ReadDist
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrimerDir {
+    Fwd,
+    Rev,
+}
+
+/// Which way a primer points, from its name: `fwd`/`forward`/`rev`/`reverse`
+/// anywhere, or a trailing `F`/`R` (`X_F`, `X_r`, `BCR-ABL1majorF`, `ENF501`,
+/// `A-R2`). A bare capital that merely ends a word (`PCR`) is not taken for a direction.
+fn primer_direction(name: &str) -> Option<PrimerDir> {
+    let lower = name.to_lowercase();
+    if lower.contains("fwd") || lower.contains("forward") {
+        return Some(PrimerDir::Fwd);
+    }
+    if lower.contains("rev") || lower.contains("reverse") {
+        return Some(PrimerDir::Rev);
+    }
+    let stem = name.trim_end_matches(|c: char| c.is_ascii_digit());
+    let had_digits = stem.len() < name.len();
+    let mut rev = stem.chars().rev();
+    let last = rev.next()?;
+    let dir = match last {
+        'F' | 'f' => PrimerDir::Fwd,
+        'R' | 'r' => PrimerDir::Rev,
+        _ => return None,
+    };
+    let before = rev.next();
+    let separated = before.map(|c| !c.is_alphanumeric()).unwrap_or(true);
+    // After a separator any case counts (`x_f`); glued to a word it must be a capital
+    // closing a camel-case or numbered name (`majorF`, `ENF501`), not the end of `PCR`.
+    let glued_ok = last.is_ascii_uppercase()
+        && (before.map(|c| c.is_ascii_lowercase()).unwrap_or(false) || had_digits);
+    (separated || glued_ok).then_some(dir)
+}
+
+/// A start/end primer pair that makes a plausible amplicon: one forward and one
+/// reverse primer. When a name does not say which way it points, any two
+/// *different* primers are accepted rather than rejecting every read.
 fn is_fwd_rev_pair(p1: &str, p2: &str) -> bool {
-    let p1_lower = p1.to_lowercase();
-    let p2_lower = p2.to_lowercase();
-    let p1_is_fwd = p1_lower.contains("fwd") || p1_lower.contains("forward");
-    let p1_is_rev = p1_lower.contains("rev") || p1_lower.contains("reverse");
-    let p2_is_fwd = p2_lower.contains("fwd") || p2_lower.contains("forward");
-    let p2_is_rev = p2_lower.contains("rev") || p2_lower.contains("reverse");
-    (p1_is_fwd && p2_is_rev) || (p1_is_rev && p2_is_fwd)
+    match (primer_direction(p1), primer_direction(p2)) {
+        (Some(a), Some(b)) => a != b,
+        _ => p1 != p2,
+    }
+}
+
+/// Is the pair of primers found at a read's two ends a valid amplicon? An amplicon
+/// defined by a single region (the read was matched by coordinates) names the same
+/// entry at both ends and is valid; the same primer at both ends of a *sequence* match is not.
+fn pair_is_valid(res: &MatchResult) -> bool {
+    match (&res.start_primer, &res.end_primer) {
+        (Some(a), Some(b)) => {
+            (a == b && res.amplicon_name.as_deref() == Some(a.as_str())) || is_fwd_rev_pair(a, b)
+        }
+        _ => true,
+    }
 }
 
 /// Dorado's own mean read quality from a FASTQ header, in either dialect.
@@ -1108,7 +1155,7 @@ where
     // Build K-mer index for optimization
     let kmer_index = if matches!(mode, MatchMode::Semiglobal) {
         log::info!("Building k-mer index for {} primers...", primers.len());
-        Some(KmerIndex::build(primers.clone(), 8))
+        Some(KmerIndex::build(primers.clone(), prefilter_kmer_size(&primers, max_edit_dist)))
     } else {
         None
     };
@@ -1514,6 +1561,12 @@ where
     log::info!("Reading BAM: {}", bam_path);
     let mut bam = bam::Reader::from_path(bam_path).context("Failed to open BAM file")?;
     bam.set_threads(threads).ok();
+    let target_names: Vec<String> = bam
+        .header()
+        .target_names()
+        .iter()
+        .map(|n| String::from_utf8_lossy(n).to_string())
+        .collect();
 
     if let Some(reference) = reference {
         log::info!("Reference provided: {}", reference);
@@ -1550,8 +1603,17 @@ where
     let mut writers: HashMap<String, Box<dyn std::io::Write>> = HashMap::new();
     let mut top_reads: HashMap<String, std::collections::BinaryHeap<TopReadRecord>> = HashMap::new();
 
+    let mut skipped_non_primary = 0usize;
     for result in bam.records() {
         let record = result?;
+        // A read split over several alignments (a fusion, a chimera) has one primary
+        // record and supplementary/secondary ones: only the primary is the read.
+        // Counting the others double-counts it, repeats it in --output-fastq and
+        // inflates "failed primer match" with hard-clipped fragments.
+        if record.is_secondary() || record.is_supplementary() {
+            skipped_non_primary += 1;
+            continue;
+        }
         total_raw_reads += 1;
         total_seen += 1;
 
@@ -1585,10 +1647,11 @@ where
 
         let read_id = String::from_utf8_lossy(record.qname()).to_string();
         let res = if matches!(mode, MatchMode::Coords) {
-            match_read_coords(&record, 0)
+            match_read_coords(&record, &target_names, 0, &primers, primer_tolerance)
         } else {
             match_read_sequence(
                 &record,
+                &target_names,
                 0,
                 &primers,
                 kmer_index.as_ref(),
@@ -1629,11 +1692,7 @@ where
         }
 
         if let Some(name) = &res.amplicon_name {
-            let is_valid = if let (Some(p1), Some(p2)) = (&res.start_primer, &res.end_primer) {
-                is_fwd_rev_pair(p1, p2)
-            } else {
-                true // In coordinate mode, assume valid coord match
-            };
+            let is_valid = pair_is_valid(&res);
 
             if is_valid {
                 let stats = amplicons.entry(name.clone()).or_default();
@@ -1654,12 +1713,18 @@ where
                 }
 
                 if let Some(ref out_path) = output_fastq {
-                    let seq_bytes = record.seq().as_bytes();
-                    let qual_bytes: Vec<u8> = if record.qual().is_empty() {
+                    // FASTQ is written the way the read came off the sequencer: a BAM keeps
+                    // a reverse-strand read as its reverse complement.
+                    let mut seq_bytes = record.seq().as_bytes();
+                    let mut qual_bytes: Vec<u8> = if record.qual().is_empty() {
                         vec![b'?'; seq_bytes.len()]
                     } else {
                         record.qual().iter().map(|&q| nanoseq_core::quality::phred_to_fastq_ascii(q)).collect()
                     };
+                    if record.is_reverse() {
+                        seq_bytes = reverse_complement_bytes(&seq_bytes);
+                        qual_bytes.reverse();
+                    }
 
                     if top_n > 0 {
                         add_to_top_reads(
@@ -1727,6 +1792,9 @@ where
         }
     }
 
+    if skipped_non_primary > 0 {
+        log::info!("Ignored {} secondary/supplementary alignment records", skipped_non_primary);
+    }
     log::info!(
         "Processed {} reads after filters (seen={}, mode={}, tol={}, dist={}, end={}, min_qs={}, min_len={}, duplex_only={})...",
         total_processed,
@@ -2110,5 +2178,310 @@ mod qs_header_tests {
     #[test]
     fn does_not_match_a_tag_that_merely_starts_with_qs() {
         assert_eq!(parse_qs_from_header("@read1 qsx:f:9.0 qst=4"), None);
+    }
+}
+
+/// Black-box tests of the amplicon matcher on synthetic BAMs.
+#[cfg(test)]
+mod matcher_behaviour_tests {
+    use super::*;
+    use crate::primers::reverse_complement;
+    use rust_htslib::bam::header::HeaderRecord;
+    use rust_htslib::bam::record::{Cigar, CigarString};
+    use rust_htslib::bam::{Format, Header, Record, Writer};
+    use std::path::Path;
+
+    const FWD: &str = "ACCGCATGTTCCGGGACAAAAG";
+    const REV: &str = "TCCACTTCGTCTGAGATACTGGATT";
+
+    /// Deterministic pseudo-random bases so reads are not low-complexity.
+    fn body(seed: u64, n: usize) -> String {
+        let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                ['A', 'C', 'G', 'T'][(x % 4) as usize]
+            })
+            .collect()
+    }
+
+    /// An amplicon read: forward primer, insert, reverse complement of the reverse primer.
+    fn amplicon(seed: u64, fwd: &str) -> String {
+        format!("{}{}{}", fwd, body(seed, 500), reverse_complement(REV))
+    }
+
+    /// Substitute `n` bases of `s` with their complements, spread out so that no cheaper
+    /// alignment (an indel plus a shift) exists: the true edit distance is exactly `n`.
+    fn substitute(s: &str, n: usize) -> String {
+        let positions = [3usize, 9, 15, 20];
+        s.chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if positions[..n.min(4)].contains(&i) {
+                    match c {
+                        'A' => 'T',
+                        'T' => 'A',
+                        'C' => 'G',
+                        _ => 'C',
+                    }
+                } else {
+                    c
+                }
+            })
+            .collect()
+    }
+
+    struct Rec {
+        name: String,
+        flags: u16,
+        tid: i32,
+        pos: i64,
+        cigar: Vec<Cigar>,
+        seq: String,
+    }
+
+    impl Rec {
+        fn unmapped(name: &str, seq: &str) -> Rec {
+            Rec { name: name.into(), flags: 4, tid: -1, pos: -1, cigar: vec![], seq: seq.into() }
+        }
+        fn mapped(name: &str, flags: u16, tid: i32, pos: i64, cigar: Vec<Cigar>, seq: &str) -> Rec {
+            Rec { name: name.into(), flags, tid, pos, cigar, seq: seq.into() }
+        }
+    }
+
+    fn write_bam(path: &Path, recs: &[Rec]) {
+        let mut header = Header::new();
+        for (name, len) in [("chr9", 300_000i64), ("chr22", 300_000i64)] {
+            header.push_record(HeaderRecord::new(b"SQ").push_tag(b"SN", name).push_tag(b"LN", len));
+        }
+        let mut w = Writer::from_path(path, &header, Format::Bam).unwrap();
+        for r in recs {
+            let mut rec = Record::new();
+            let qual = vec![30u8; r.seq.len()];
+            let cigar = (!r.cigar.is_empty()).then(|| CigarString(r.cigar.clone()));
+            rec.set(r.name.as_bytes(), cigar.as_ref(), r.seq.as_bytes(), &qual);
+            rec.set_flags(r.flags);
+            rec.set_tid(r.tid);
+            rec.set_pos(r.pos);
+            if r.tid >= 0 {
+                rec.set_mapq(60);
+            }
+            w.write(&rec).unwrap();
+        }
+    }
+
+    fn primers_file(dir: &Path, lines: &[&str]) -> String {
+        let p = dir.join("primers.tsv");
+        std::fs::write(&p, lines.join("\n")).unwrap();
+        p.to_string_lossy().into()
+    }
+
+    fn run(dir: &Path, bam: &Path, primers: &str, mode: MatchMode, max_edit: usize, fastq: Option<&Path>) -> AmpliconResult {
+        run_amplicons(
+            &bam.to_string_lossy(), primers, 1, mode, max_edit, 150, false, 50, 0.0, (0, usize::MAX), 0, false,
+            None, None, fastq.map(|f| f.to_str().unwrap().to_string()).as_deref(), None, false, false, 0,
+        )
+        .map(|r| {
+            let _ = dir;
+            r
+        })
+        .unwrap()
+    }
+
+    fn fastq_names(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .step_by(4)
+            .map(|l| l.trim_start_matches('@').to_string())
+            .collect()
+    }
+
+    // ------------------------------------------------------------ (a) edit distance
+
+    #[test]
+    fn align_accepts_a_primer_with_up_to_max_edit_dist_errors() {
+        let p = FWD.as_bytes();
+        for subs in 0..=3usize {
+            let text = format!("GGTTAACCGGTT{}TTGGCCAATTGG", substitute(FWD, subs));
+            assert_eq!(semi_global_align(p, text.as_bytes(), 3), Some(subs as u32), "{subs} substitutions");
+        }
+        let four = format!("GGTTAACCGGTT{}TTGGCCAATTGG", substitute(FWD, 4));
+        assert_eq!(semi_global_align(p, four.as_bytes(), 3), None, "4 errors exceed the limit of 3");
+        let one = format!("GGTTAACCGGTT{}TTGGCCAATTGG", substitute(FWD, 1));
+        assert_eq!(semi_global_align(p, one.as_bytes(), 0), None, "--max-edit-dist 0 means exact");
+
+        // Indels count as one edit each.
+        let del = format!("GGTTAACC{}{}TTGG", &FWD[..10], &FWD[11..]);
+        assert_eq!(semi_global_align(p, del.as_bytes(), 3), Some(1));
+        let ins = format!("GGTTAACC{}T{}TTGG", &FWD[..10], &FWD[10..]);
+        assert_eq!(semi_global_align(p, ins.as_bytes(), 3), Some(1));
+        assert_eq!(semi_global_align(p, b"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", 3), None);
+    }
+
+    #[test]
+    fn max_edit_dist_decides_how_many_reads_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recs = Vec::new();
+        for subs in 0..4usize {
+            for i in 0..25u64 {
+                let seq = amplicon(i + 1, &substitute(FWD, subs));
+                recs.push(Rec::unmapped(&format!("r{subs}_{i}"), &seq));
+            }
+        }
+        let bam = dir.path().join("in.bam");
+        write_bam(&bam, &recs);
+        let primers = primers_file(dir.path(), &[&format!("AMP_fwd {FWD}"), &format!("AMP_rev {REV}")]);
+        let matched = |k: usize| {
+            let r = run(dir.path(), &bam, &primers, MatchMode::Semiglobal, k, None);
+            r.amplicons.values().map(|a| a.count).sum::<usize>()
+        };
+        assert_eq!(matched(0), 25);
+        assert_eq!(matched(1), 50);
+        assert_eq!(matched(2), 75);
+        assert_eq!(matched(3), 100);
+    }
+
+    // ------------------------------------------------------------ (b) split reads
+
+    #[test]
+    fn supplementary_and_secondary_records_are_not_extra_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recs = Vec::new();
+        for i in 0..10u64 {
+            let seq = amplicon(i + 1, FWD);
+            let n = format!("fusion{i}");
+            recs.push(Rec::mapped(&n, 0, 1, 1000 + 10 * i as i64, vec![Cigar::Match(seq.len() as u32)], &seq));
+            recs.push(Rec::mapped(&n, 0x800, 0, 5000, vec![Cigar::SoftClip(100), Cigar::Match(seq.len() as u32 - 100)], &seq));
+            recs.push(Rec::mapped(&n, 0x100, 0, 9000, vec![Cigar::Match(seq.len() as u32)], &seq));
+        }
+        let bam = dir.path().join("in.bam");
+        write_bam(&bam, &recs);
+        let primers = primers_file(dir.path(), &[&format!("AMP_fwd {FWD}"), &format!("AMP_rev {REV}")]);
+        let out = dir.path().join("out.fastq");
+        let r = run(dir.path(), &bam, &primers, MatchMode::Semiglobal, 3, Some(&out));
+        assert_eq!(r.total_raw_reads, 10, "one read per name");
+        assert_eq!(r.amplicons.values().map(|a| a.count).sum::<usize>(), 10);
+        let names = fastq_names(&out);
+        let unique: std::collections::BTreeSet<_> = names.iter().cloned().collect();
+        assert_eq!((names.len(), unique.len()), (10, 10), "no duplicated FASTQ records: {names:?}");
+    }
+
+    #[test]
+    fn reverse_strand_reads_are_written_in_their_original_orientation() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = amplicon(7, FWD);
+        // A BAM stores a reverse-strand read as its reverse complement.
+        let stored = reverse_complement(&original);
+        let rec = Rec::mapped("rev", 16, 1, 1000, vec![Cigar::Match(stored.len() as u32)], &stored);
+        let bam = dir.path().join("in.bam");
+        write_bam(&bam, &[rec]);
+        let primers = primers_file(dir.path(), &[&format!("AMP_fwd {FWD}"), &format!("AMP_rev {REV}")]);
+        let out = dir.path().join("out.fastq");
+        let r = run(dir.path(), &bam, &primers, MatchMode::Semiglobal, 3, Some(&out));
+        assert_eq!(r.amplicons.values().map(|a| a.count).sum::<usize>(), 1, "matched either way round");
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(text.lines().nth(1).unwrap(), original);
+    }
+
+    // ------------------------------------------------------------ (c) contig names and coordinates
+
+    #[test]
+    fn mapped_reads_report_contig_names_and_reference_ends_and_match_by_region() {
+        let dir = tempfile::tempdir().unwrap();
+        // 200 soft-clipped bases then 700 aligned: the reference end is pos+700, not pos+900.
+        let recs: Vec<Rec> = (0..5u64)
+            .map(|i| {
+                let seq = body(i + 11, 900);
+                Rec::mapped(&format!("m{i}"), 0, 0, 1000, vec![Cigar::SoftClip(200), Cigar::Match(700)], &seq)
+            })
+            .collect();
+        let bam = dir.path().join("in.bam");
+        write_bam(&bam, &recs);
+        // One entry describing the whole amplicon by its region (no usable sequence).
+        let primers = primers_file(dir.path(), &["AMP1 ACGTACGTACGTACGTACGT chr9:1000-1700"]);
+        let r = run(dir.path(), &bam, &primers, MatchMode::Semiglobal, 3, None);
+        let a = r.amplicons.get("AMP1").unwrap_or_else(|| panic!("matched by region: {:?}", r.amplicons.keys().collect::<Vec<_>>()));
+        assert_eq!(a.count, 5);
+        assert_eq!(a.chrom.as_deref(), Some("chr9"), "a contig name, not its index");
+    }
+
+    #[test]
+    fn coords_mode_assigns_reads_to_the_primer_region_not_to_their_own_coordinates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recs = Vec::new();
+        for i in 0..5u64 {
+            recs.push(Rec::mapped(&format!("in{i}"), 0, 0, 1000 + i as i64, vec![Cigar::Match(700)], &body(i, 700)));
+        }
+        recs.push(Rec::mapped("out", 0, 0, 90_000, vec![Cigar::Match(700)], &body(99, 700)));
+        recs.push(Rec::unmapped("un", &body(98, 700)));
+        let bam = dir.path().join("in.bam");
+        write_bam(&bam, &recs);
+        let primers = primers_file(dir.path(), &["AMP1 ACGTACGTACGTACGTACGT chr9:1000-1700"]);
+        let r = run(dir.path(), &bam, &primers, MatchMode::Coords, 3, None);
+        assert_eq!(r.amplicons.keys().collect::<Vec<_>>(), ["AMP1"], "one amplicon, not one per read");
+        assert_eq!(r.amplicons["AMP1"].count, 5);
+    }
+
+    /// nagini's layout: forward and reverse primers are separate entries on different
+    /// chromosomes (a BCR-ABL1 fusion read starts on chr22 and ends on chr9), so a
+    /// region can never match both ends. A region hit for one end must not stop the
+    /// sequence match from deciding the pair.
+    #[test]
+    fn a_single_region_hit_does_not_override_sequence_matching() {
+        let dir = tempfile::tempdir().unwrap();
+        let seq = amplicon(5, &substitute(FWD, 1));
+        let rec = Rec::mapped("fusion", 0, 1, 1000, vec![Cigar::Match(seq.len() as u32)], &seq);
+        let bam = dir.path().join("in.bam");
+        write_bam(&bam, &[rec]);
+        let primers = primers_file(
+            dir.path(),
+            &[&format!("BCR_fwd {FWD} chr22:1000-1022"), &format!("ABL_rev {REV} chr9:2000-2025")],
+        );
+        let r = run(dir.path(), &bam, &primers, MatchMode::Semiglobal, 3, None);
+        let a = r.amplicons.get("ABL_rev-BCR_fwd").unwrap_or_else(|| panic!("{:?}", r.amplicons.keys().collect::<Vec<_>>()));
+        assert_eq!(a.count, 1);
+        let stats = &r.primer_matching_stats["BCR_fwd"];
+        assert_eq!(stats.total_edit_distance, 1, "the real edit distance, not the window slack");
+    }
+
+    // ------------------------------------------------------------ (d) primer names
+
+    #[test]
+    fn forward_and_reverse_primers_are_recognised_from_common_naming_schemes() {
+        for (a, b) in [
+            ("BCR-ABL1minor_fwd", "BCR-ABL1_rev"),
+            ("X_forward", "X_reverse"),
+            ("TP53_3kb_A1_F", "TP53_3kb_A1_R"),
+            ("BCR-ABL1majorF", "BCR-ABL1_R"),
+            ("ENF501", "ENR561"),
+            ("x_f", "x_r"),
+            ("A-F2", "A-R2"),
+        ] {
+            assert!(is_fwd_rev_pair(a, b), "{a} + {b}");
+            assert!(is_fwd_rev_pair(b, a), "{b} + {a}");
+        }
+        for (a, b) in [("X_F", "Y_F"), ("a_fwd", "b_fwd"), ("same_R", "same_R"), ("x_rev", "y_reverse")] {
+            assert!(!is_fwd_rev_pair(a, b), "{a} + {b} are not a pair");
+        }
+    }
+
+    #[test]
+    fn fastq_input_tolerates_primer_errors_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut text = String::new();
+        for subs in 0..4usize {
+            let seq = amplicon(subs as u64 + 40, &substitute(FWD, subs));
+            text.push_str(&format!("@r{subs}\n{seq}\n+\n{}\n", "I".repeat(seq.len())));
+        }
+        let fq = dir.path().join("in.fastq");
+        std::fs::write(&fq, text).unwrap();
+        let primers = primers_file(dir.path(), &[&format!("AMP_fwd {FWD}"), &format!("AMP_rev {REV}")]);
+        let r = run(dir.path(), &fq, &primers, MatchMode::Semiglobal, 3, None);
+        assert_eq!(r.amplicons.values().map(|a| a.count).sum::<usize>(), 4);
+        let r = run(dir.path(), &fq, &primers, MatchMode::Semiglobal, 1, None);
+        assert_eq!(r.amplicons.values().map(|a| a.count).sum::<usize>(), 2);
     }
 }

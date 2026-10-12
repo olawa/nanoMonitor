@@ -223,9 +223,20 @@ pub fn run_stats(
     bam.set_threads(threads).ok();
 
     // Collect all reads first (for parallel processing)
+    let target_names: Vec<String> = bam
+        .header()
+        .target_names()
+        .iter()
+        .map(|n| String::from_utf8_lossy(n).to_string())
+        .collect();
     let mut all_reads: Vec<bam::Record> = Vec::new();
     for result in bam.records() {
         let record = result.context("Failed to read BAM record")?;
+        // One entry per read: a split read's supplementary and secondary alignments
+        // are not further reads.
+        if record.is_secondary() || record.is_supplementary() {
+            continue;
+        }
         all_reads.push(record);
     }
 
@@ -245,10 +256,10 @@ pub fn run_stats(
 
             let id = String::from_utf8_lossy(record.qname()).to_string();
             let acc = calculate_accuracy(record);
-            let chrom = if record.is_unmapped() {
+            let chrom = if record.is_unmapped() || record.tid() < 0 {
                 None
             } else {
-                Some(record.tid().to_string()) // TODO: resolve to actual name
+                target_names.get(record.tid() as usize).cloned()
             };
             let pos = if record.is_unmapped() {
                 None
@@ -284,4 +295,37 @@ pub fn run_stats(
 
     log::info!("Done. {} reads passed filters.", result.passed_reads);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_htslib::bam::header::HeaderRecord;
+    use rust_htslib::bam::record::{Cigar, CigarString};
+    use rust_htslib::bam::{Format, Header, Record, Writer};
+
+    #[test]
+    fn counts_each_read_once_and_names_its_contig() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.bam");
+        let mut header = Header::new();
+        header.push_record(HeaderRecord::new(b"SQ").push_tag(b"SN", "chr9").push_tag(b"LN", 100_000i64));
+        header.push_record(HeaderRecord::new(b"SQ").push_tag(b"SN", "chr22").push_tag(b"LN", 100_000i64));
+        let mut w = Writer::from_path(&path, &header, Format::Bam).unwrap();
+        for (flags, tid, pos) in [(0u16, 1i32, 100i64), (0x800, 0, 500), (0x100, 0, 900)] {
+            let mut r = Record::new();
+            let seq = vec![b'A'; 50];
+            r.set(b"fusion", Some(&CigarString(vec![Cigar::Match(50)])), &seq, &vec![30u8; 50]);
+            r.set_flags(flags);
+            r.set_tid(tid);
+            r.set_pos(pos);
+            w.write(&r).unwrap();
+        }
+        drop(w);
+        let out = dir.path().join("out.json");
+        run_stats(path.to_str().unwrap(), out.to_str().unwrap(), 1, 0.0, 0).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
+        assert_eq!(v["total_reads"], 1);
+        assert_eq!(v["per_read"][0]["chrom"], "chr22");
+    }
 }
