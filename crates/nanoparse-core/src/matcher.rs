@@ -863,13 +863,23 @@ fn is_fwd_rev_pair(p1: &str, p2: &str) -> bool {
     (p1_is_fwd && p2_is_rev) || (p1_is_rev && p2_is_fwd)
 }
 
+/// Dorado's own mean read quality from a FASTQ header, in either dialect.
+///
+/// MinKNOW writes SAM-style tags (`qs:f:18.9348`); guppy-era output wrote
+/// `qs=18.9348`. Only the second was recognised, so on current MinKNOW FASTQ
+/// this found nothing and the caller silently recomputed from the quality
+/// string instead -- which is a different number, so --min-qs did not mean
+/// what dorado --min-qscore means.
 fn parse_qs_from_header(header: &str) -> Option<f32> {
     for part in header.split_whitespace().skip(1) {
-        if let Some((key, value)) = part.split_once('=') {
-            if key == "qs" {
-                if let Ok(v) = value.parse::<f32>() {
-                    return Some(v);
-                }
+        let value = part
+            .strip_prefix("qs:")
+            .and_then(|rest| rest.split_once(':'))
+            .map(|(_kind, value)| value)
+            .or_else(|| part.strip_prefix("qs="));
+        if let Some(value) = value {
+            if let Ok(v) = value.parse::<f32>() {
+                return Some(v);
             }
         }
     }
@@ -2060,5 +2070,37 @@ mod tests {
         assert!(written.contains("@read_high\n"));
         assert!(!written.contains("@read_low\n"));
         assert!(!written.contains("@read_mid\n"));
+    }
+}
+
+
+
+#[cfg(test)]
+mod qs_header_tests {
+    use super::parse_qs_from_header;
+
+    #[test]
+    fn reads_a_minknow_sam_tag_header() {
+        let header = "@afb174c8-3078-4db2-bc17-dea9a9b09f55 qs:f:18.9348 mx:i:4 ch:i:566 \
+                      st:Z:2026-08-28T10:15:56.552323+00:00 SM:Z:barcode01 al:Z:barcode01";
+        assert_eq!(parse_qs_from_header(header), Some(18.9348));
+    }
+
+    #[test]
+    fn still_reads_a_guppy_header() {
+        assert_eq!(
+            parse_qs_from_header("@read1 runid=abc qs=12.5 ch=7"),
+            Some(12.5),
+        );
+    }
+
+    #[test]
+    fn returns_none_when_the_tag_is_absent() {
+        assert_eq!(parse_qs_from_header("@read1 runid=abc ch:i:7"), None);
+    }
+
+    #[test]
+    fn does_not_match_a_tag_that_merely_starts_with_qs() {
+        assert_eq!(parse_qs_from_header("@read1 qsx:f:9.0 qst=4"), None);
     }
 }

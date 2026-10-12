@@ -686,12 +686,27 @@ fn matches_time_window_from_record(record: &bam::Record, window: Option<&TimeWin
 }
 
 pub fn get_quality_score_lowlevel(record: &bam::Record) -> Result<f64> {
-    let tag = sam::alignment::record::data::field::Tag::new(b'Q', b'S');
-    let explicit_qs = match record.data().get(&tag) {
+    // Dorado writes the mean read quality as lowercase `qs`, and as a float.
+    // Looking up `QS` found nothing, so this silently recomputed from the
+    // quality string on every real BAM -- the bug the FASTQ path had.
+    // `QS` stays as a fallback because some tooling re-emits it that way, and
+    // every integer width is accepted because a whole-number qs can be stored
+    // in any of them depending on who wrote the file.
+    let explicit_qs = [
+        sam::alignment::record::data::field::Tag::new(b'q', b's'),
+        sam::alignment::record::data::field::Tag::new(b'Q', b'S'),
+    ]
+    .iter()
+    .find_map(|tag| match record.data().get(tag) {
         Some(Ok(Value::Float(qv))) => Some(qv as f64),
+        Some(Ok(Value::Int8(qv))) => Some(qv as f64),
+        Some(Ok(Value::UInt8(qv))) => Some(qv as f64),
+        Some(Ok(Value::Int16(qv))) => Some(qv as f64),
+        Some(Ok(Value::UInt16(qv))) => Some(qv as f64),
         Some(Ok(Value::Int32(qv))) => Some(qv as f64),
+        Some(Ok(Value::UInt32(qv))) => Some(qv as f64),
         _ => None,
-    };
+    });
 
     let qual = record.quality_scores();
     if qual.is_empty() {
@@ -780,5 +795,54 @@ mod tests {
         let dt = unix_seconds_to_datetime(1_710_633_600.0).unwrap();
         let expected = DateTime::parse_from_rfc3339("2024-03-17T00:00:00+00:00").unwrap();
         assert_eq!(dt, expected);
+    }
+}
+
+#[cfg(test)]
+mod qs_tag_tests {
+    use super::get_quality_score_lowlevel;
+    use noodles::bam;
+    use noodles::sam::alignment::io::Write as _;
+    use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
+    use noodles::sam::alignment::RecordBuf;
+    use noodles::sam::Header;
+
+    /// Round-trip a record through BAM encoding so the test reads the tag back
+    /// the same way a real file does.
+    fn record_with_tag(tag: [u8; 2], value: BufValue, qual: &[u8]) -> bam::Record {
+        let header = Header::default();
+        let mut buf = RecordBuf::default();
+        *buf.sequence_mut() = vec![b'A'; qual.len()].into();
+        *buf.quality_scores_mut() = qual.to_vec().into();
+        buf.data_mut().insert(tag.into(), value);
+
+        let mut encoded = Vec::new();
+        let mut writer = bam::io::Writer::from(&mut encoded);
+        writer.write_alignment_record(&header, &buf).unwrap();
+
+        let mut reader = bam::io::Reader::from(&encoded[..]);
+        let mut record = bam::Record::default();
+        reader.read_record(&mut record).unwrap();
+        record
+    }
+
+    #[test]
+    fn reads_the_lowercase_qs_tag_dorado_writes() {
+        // All-Q40 quality string, so a recomputed value would be 40.
+        let record = record_with_tag(*b"qs", BufValue::Float(18.9348), &[40; 100]);
+        let qv = get_quality_score_lowlevel(&record).unwrap();
+        assert!((qv - 18.9348).abs() < 1e-4, "got {qv}");
+    }
+
+    #[test]
+    fn accepts_an_integer_qs() {
+        let record = record_with_tag(*b"qs", BufValue::UInt8(19), &[40; 100]);
+        assert!((get_quality_score_lowlevel(&record).unwrap() - 19.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn falls_back_to_the_quality_string_without_the_tag() {
+        let record = record_with_tag(*b"xx", BufValue::Float(1.0), &[40; 100]);
+        assert!((get_quality_score_lowlevel(&record).unwrap() - 40.0).abs() < 1e-6);
     }
 }

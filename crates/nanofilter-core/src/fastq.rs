@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use crate::bam::{FilterSettings, UnalignedBamWriter};
 use crate::barcode;
-use crate::filter::calculate_phred_avg;
+use crate::filter::read_mean_qv;
 
 struct OwnedRecord {
     id: Vec<u8>,
@@ -75,7 +75,7 @@ pub fn filter_fastq_with_settings(
                 let qual = record
                     .qual()
                     .ok_or_else(|| anyhow::anyhow!("No quality scores"))?;
-                let avg_qv = calculate_phred_avg(qual);
+                let avg_qv = read_mean_qv(&metadata, qual);
                 if avg_qv >= settings.qv_threshold {
                     let id = record.id();
                     let read_name = id.split(|&b| b == b' ').next().unwrap_or(id);
@@ -116,7 +116,7 @@ pub fn filter_fastq_with_settings(
                 let qual = record
                     .qual()
                     .ok_or_else(|| anyhow::anyhow!("No quality scores"))?;
-                let avg_qv = calculate_phred_avg(qual);
+                let avg_qv = read_mean_qv(&metadata, qual);
                 if avg_qv >= settings.qv_threshold {
                     record.write(&mut writer, None)?;
                     kept += 1;
