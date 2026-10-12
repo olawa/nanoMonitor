@@ -1,6 +1,7 @@
 use crate::align::{align_reads, ensure_index, tool_version, AlignCounts};
 use crate::config::EngineConfig;
 use crate::ledger::{Ledger, LedgerEntry};
+use crate::prelim::{PrelimJob, PrelimRunner};
 use crate::reads::{filter_settings, load_fastq, LoadedFile, Read, ReadCounts};
 use crate::state::{now_unix, write_provenance, State};
 use crate::store::Store;
@@ -41,6 +42,7 @@ pub struct Engine {
     last_cycle: Option<Instant>,
     last_compact: Instant,
     cycle_counter: u64,
+    prelim: Option<PrelimRunner>,
 }
 
 impl Engine {
@@ -81,6 +83,13 @@ impl Engine {
             }
         }
 
+        let prelim = match &cfg.prelim {
+            Some(p) => {
+                p.check()?;
+                Some(PrelimRunner::spawn(p.clone(), cfg.out_dir.clone()))
+            }
+            None => None,
+        };
         let settings = filter_settings(cfg.min_qv, cfg.min_len, cfg.max_len);
         let watcher = Watcher::new(&cfg.input_dir, cfg.include_fail, cfg.stable_secs);
         Ok(Self {
@@ -94,6 +103,7 @@ impl Engine {
             last_cycle: None,
             last_compact: Instant::now(),
             cycle_counter: 0,
+            prelim,
             cfg,
         })
     }
@@ -186,6 +196,7 @@ impl Engine {
             report.compacted = self.compact_all()?;
         }
         report.waiting = waiting;
+        self.collect_prelim();
         self.refresh_pending();
         self.state.status = if report.aligned { "running" } else { "idle" }.into();
         self.save_state()?;
@@ -289,11 +300,45 @@ impl Engine {
                 b.compacted_generation = c.generation;
                 b.compacted_unix = Some(now_unix());
                 log::info!("{name}: compacted {} segments into {}", c.segments_folded, c.bam.display());
+                if let Some(runner) = &self.prelim {
+                    let reads_passed = self.state.barcode(&name).reads_passed;
+                    let job = PrelimJob {
+                        barcode: name.clone(),
+                        bam: c.bam.clone(),
+                        generation: c.generation,
+                        reads_passed,
+                    };
+                    let b = self.state.barcode(&name);
+                    b.prelim_status = Some("queued".into());
+                    b.prelim_summary = Some(
+                        self.cfg.out_dir.join(&name).join("prelim/summary.json").to_string_lossy().into(),
+                    );
+                    if let Err(e) = runner.submit(job) {
+                        log::warn!("{name}: preliminary analysis not queued: {e:#}");
+                    }
+                }
             }
         }
         self.last_compact = Instant::now();
         self.refresh_pending();
         Ok(any)
+    }
+
+    /// Record finished preliminary analyses in the state.
+    fn collect_prelim(&mut self) {
+        let mut finished = Vec::new();
+        if let Some(r) = &self.prelim {
+            while let Ok(d) = r.done.try_recv() {
+                finished.push(d);
+            }
+        }
+        for d in finished {
+            let b = self.state.barcode(&d.barcode);
+            b.prelim_generation = Some(d.generation);
+            b.prelim_status = Some(d.status);
+            b.prelim_unix = Some(now_unix());
+            b.prelim_error = d.error;
+        }
     }
 
     fn refresh_pending(&mut self) {
@@ -341,6 +386,11 @@ impl Engine {
             std::thread::sleep(Duration::from_secs(self.cfg.poll_secs.max(1)));
         }
         self.compact_all()?;
+        // Let the last preliminary analysis finish: it is the result of the run.
+        if let Some(r) = self.prelim.as_mut() {
+            r.shutdown();
+        }
+        self.collect_prelim();
         self.state.status = "finished".into();
         self.save_state()?;
         Ok(())
@@ -634,5 +684,39 @@ mod tests {
         engine.compact_all().unwrap();
         let bam = PathBuf::from(engine.state.barcodes["barcode01"].compacted_bam.clone().unwrap());
         assert_eq!(bam_names(&bam).len(), names.len());
+    }
+
+    #[test]
+    fn each_snapshot_gets_a_preliminary_analysis_and_the_state_says_so() {
+        if !tools_available() {
+            return;
+        }
+        let mut fx = Fixture::new();
+        fx.write_chunk("fastq_pass/barcode01/a_0.fastq.gz", 60, true);
+        fx.write_chunk("fastq_pass/barcode02/b_0.fastq.gz", 60, true);
+        let mut cfg = fx.config();
+        cfg.prelim = Some(crate::prelim::stub::nagini(&fx.root.join("nagini"), false));
+
+        let mut engine = Engine::new(cfg.clone()).unwrap();
+        engine.run(&AtomicBool::new(false)).unwrap();
+
+        for barcode in ["barcode01", "barcode02"] {
+            let b = &engine.state.barcodes[barcode];
+            assert_eq!(b.prelim_status.as_deref(), Some("ok"), "{barcode}");
+            assert_eq!(b.prelim_generation, Some(1));
+            let summary: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(b.prelim_summary.clone().unwrap()).unwrap()).unwrap();
+            assert_eq!(summary["barcode"], barcode);
+            assert_eq!(summary["reads_passed"].as_u64().unwrap(), b.reads_passed);
+            assert_eq!(summary["fusion"]["primary_isoform"], "e14a2");
+        }
+        // A second generation appends to the history instead of replacing it.
+        drop(engine);
+        fx.write_chunk("fastq_pass/barcode01/a_1.fastq.gz", 30, true);
+        let mut engine = Engine::new(cfg).unwrap();
+        engine.run(&AtomicBool::new(false)).unwrap();
+        let history = std::fs::read_to_string(fx.root.join("out/barcode01/prelim/history.jsonl")).unwrap();
+        assert_eq!(history.lines().count(), 2);
+        assert_eq!(engine.state.barcodes["barcode01"].prelim_generation, Some(2));
     }
 }

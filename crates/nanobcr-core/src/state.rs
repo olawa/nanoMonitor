@@ -21,6 +21,7 @@ pub fn now_unix() -> u64 {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BarcodeState {
     pub files: u64,
     pub reads_seen: u64,
@@ -41,6 +42,13 @@ pub struct BarcodeState {
     pub compacted_unix: Option<u64>,
     pub last_file: Option<String>,
     pub last_update_unix: u64,
+    /// Preliminary analysis of the latest snapshot: generation analysed, outcome,
+    /// and where `summary.json` is.
+    pub prelim_generation: Option<u64>,
+    pub prelim_status: Option<String>,
+    pub prelim_unix: Option<u64>,
+    pub prelim_error: Option<String>,
+    pub prelim_summary: Option<String>,
 }
 
 impl BarcodeState {

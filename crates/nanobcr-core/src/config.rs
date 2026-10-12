@@ -1,3 +1,4 @@
+use crate::prelim::PrelimConfig;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -34,6 +35,8 @@ pub struct EngineConfig {
     pub max_reads_per_cycle: usize,
     /// Process what is there, compact, and exit instead of watching.
     pub once: bool,
+    /// Run nagini's BCR-ABL scripts on every new snapshot (needs a nagini checkout).
+    pub prelim: Option<PrelimConfig>,
 }
 
 impl EngineConfig {
@@ -57,6 +60,7 @@ impl EngineConfig {
             snapshot_secs: 600,
             max_reads_per_cycle: 200_000,
             once: false,
+            prelim: None,
         }
     }
 }

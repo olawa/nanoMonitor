@@ -184,6 +184,34 @@ Known gaps / follow-ups:
 - "Enough data" indicator per sample: Branford-site min depth and fusion `PRIMARY` status
   (>=5 reads) from nagini's thresholds; MinKNOW `final_summary_*.txt` marks run end.
 
+#### Phase 2 status (2026-10-12): implemented in `nanobcr-core::prelim`; `watch --nagini DIR` and `bcr-abl analyze`
+
+Decision: **the preliminary analysis runs nagini's own scripts; no Rust re-implementation.** On every new
+snapshot a background worker (never blocking an alignment cycle; queued snapshots of one barcode are
+coalesced to the newest) runs `bcr_abl_fusion_counter.py`, `bcr_abl_branford_caller.py` and
+`bcr_abl_phaser.py` with the arguments, resources and thresholds from nagini's own `bcr_abl.smk` and
+`config.yaml`, on a private hard-linked copy of the snapshot. It writes `<out>/<barcode>/prelim/`
+(the full script outputs, `summary.json` for the GUI, and one line per snapshot in `history.jsonl`),
+and `state.json` carries `prelim_generation/status/unix/error/summary` per barcode. A failing stage
+is reported (`status: partial`) without losing the others. `summary.json` also has a `sufficiency`
+block: a PRIMARY fusion call and >= 95 % of Branford sites at nagini's `min_depth`; its inputs are recorded
+so the heuristic can be judged. `bcr_abl_exon_coverage.py` is not run live (slow; final pipeline only).
+
+The Rust per-read live counters planned for this phase were dropped: on the real barcode24 BAM
+the fusion counter takes 1.7 s and the phaser 7 s even at 637k records; only the Branford caller
+scales with depth (0.5 s at 2.7k reads, 92 s at ~46,000x). With a snapshot every 2-5 minutes the
+scripts keep up, and a second implementation would only add a way for the live and final numbers to
+disagree. The engine's own per-cycle counters (reads, filter outcome, mapped/supplementary) stay live.
+
+Verified on the real data, replayed live with a snapshot every 20 s: generation 1 (329 reads) already
+calls e1a2 (220 fusion reads); generation 2 (1,869 reads) shows Y253H 2.40 % and T315I 2.36 %; the final
+generation (2,742 reads) gives Y253H 2.46 %, T315I 2.35 %, CIS phasing 90 %, identical to running the scripts
+by hand on the final BAM. Tests use a stub nagini (canned script outputs, recorded argv) so the plumbing,
+nagini-config passthrough, partial failure and history are covered without pysam or clinical data.
+
+Open: the Branford step can take minutes on a full-depth run; the worker keeps up only if the snapshot
+interval is not much shorter than that. The GUI should show "analysing generation N" from `prelim_status`.
+
 ### Phase 3 — egui BCR-ABL mode
 
 - Run setup: MinKNOW run dir (or replay dir), barcode map, reference FASTA, nagini path,

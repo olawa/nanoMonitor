@@ -208,12 +208,43 @@ pub fn run_bcr_abl(cmd: cli::BcrAblCommand) -> Result<()> {
             cfg.minimap2 = a.minimap2;
             cfg.samtools = a.samtools;
             cfg.minimap2_extra = a.minimap2_extra.split_whitespace().map(String::from).collect();
+            if let Some(nagini) = a.nagini {
+                let mut p = nanobcr_core::prelim::PrelimConfig::new(nagini);
+                if let Some(py) = a.python {
+                    p.python = py;
+                }
+                p.reference_build = a.build;
+                p.threads = a.threads.min(8);
+                p.reference_fasta = a.fasta.or_else(|| {
+                    let r = &cfg.reference;
+                    (r.extension().map(|e| e != "mmi").unwrap_or(true)).then(|| r.clone())
+                });
+                cfg.prelim = Some(p);
+            }
             let mut engine = Engine::new(cfg)?;
             engine.run(&AtomicBool::new(false))
         }
         cli::BcrAblCommand::Snapshot(a) => {
             for (barcode, bam) in store::compact_out_dir(&a.out, &a.samtools, a.threads)? {
                 println!("{barcode}\t{}", bam.display());
+            }
+            Ok(())
+        }
+        cli::BcrAblCommand::Analyze(a) => {
+            let mut p = nanobcr_core::prelim::PrelimConfig::new(a.nagini);
+            if let Some(py) = a.python {
+                p.python = py;
+            }
+            p.reference_build = a.build;
+            p.threads = a.threads;
+            p.reference_fasta = a.fasta;
+            for s in nanobcr_core::prelim::analyze_out_dir(&p, &a.out, a.barcode.as_deref())? {
+                let iso = s.fusion.as_ref().and_then(|f| f.primary_isoform.clone()).unwrap_or_else(|| "-".into());
+                let muts = s.branford.as_ref().map(|b| b.mutations.len()).unwrap_or(0);
+                println!("{}\tgen{}\t{}\tfusion={}\tmutations={}\tenough={}\t{:.1}s", s.barcode, s.generation, s.status, iso, muts, s.sufficiency.as_ref().map(|x| x.enough).unwrap_or(false), s.duration_secs);
+                for e in &s.errors {
+                    eprintln!("  {e}");
+                }
             }
             Ok(())
         }

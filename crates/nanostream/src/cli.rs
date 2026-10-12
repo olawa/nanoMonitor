@@ -316,6 +316,8 @@ pub enum BcrAblCommand {
     Watch(BcrWatchArgs),
     /// Fold every barcode's pending segments into its sorted, indexed BAM (engine need not be running)
     Snapshot(BcrSnapshotArgs),
+    /// Run nagini's BCR-ABL scripts (fusion isoform, kinase-domain mutations, phasing) on the current snapshots
+    Analyze(BcrAnalyzeArgs),
     /// Feed a finished run into a directory the way MinKNOW would (for testing)
     Replay(BcrReplayArgs),
 }
@@ -349,8 +351,8 @@ pub struct BcrWatchArgs {
     /// Minimum seconds between alignment cycles
     #[arg(long, default_value_t = 20)]
     pub cycle_secs: u64,
-    /// Seconds between compactions into sorted, indexed BAMs
-    #[arg(long, default_value_t = 600)]
+    /// Seconds between compactions into sorted, indexed BAMs (each new snapshot is analysed when --nagini is set)
+    #[arg(long, default_value_t = 300)]
     pub snapshot_secs: u64,
     /// Process what is there, compact, and exit
     #[arg(long, default_value_t = false)]
@@ -362,6 +364,38 @@ pub struct BcrWatchArgs {
     /// Extra minimap2 arguments after the preset (space separated)
     #[arg(long, default_value = "-y -Y --MD")]
     pub minimap2_extra: String,
+    /// nagini checkout: run its BCR-ABL scripts on every new snapshot (preliminary analysis)
+    #[arg(long)]
+    pub nagini: Option<PathBuf>,
+    /// Python with pysam for the nagini scripts (default: nagini's .venv, else python3)
+    #[arg(long)]
+    pub python: Option<String>,
+    /// Reference FASTA for the Branford caller's k-mer check (default: --reference when it is a FASTA)
+    #[arg(long)]
+    pub fasta: Option<PathBuf>,
+    /// Reference build name for nagini's resources
+    #[arg(long, default_value = "hg19")]
+    pub build: String,
+}
+
+#[derive(Parser, Clone)]
+pub struct BcrAnalyzeArgs {
+    /// Engine output directory
+    pub out: PathBuf,
+    /// nagini checkout
+    #[arg(long)]
+    pub nagini: PathBuf,
+    #[arg(long)]
+    pub python: Option<String>,
+    #[arg(long)]
+    pub fasta: Option<PathBuf>,
+    #[arg(long, default_value = "hg19")]
+    pub build: String,
+    /// Only this barcode
+    #[arg(long)]
+    pub barcode: Option<String>,
+    #[arg(short, long, default_value_t = 4)]
+    pub threads: usize,
 }
 
 #[derive(Parser, Clone)]
