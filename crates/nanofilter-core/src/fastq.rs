@@ -135,75 +135,15 @@ pub fn make_pe(
     insert: usize,
     step: usize,
 ) -> Result<()> {
-    if len == 0 {
-        anyhow::bail!("--len must be greater than 0");
-    }
-    if step == 0 {
-        anyhow::bail!("--step must be greater than 0");
-    }
-    if insert < len {
-        anyhow::bail!("--insert must be at least as large as --len");
-    }
-
-    let (r1_path, r2_path) = make_pe_output_paths(output_prefix)?;
-    let mut r1_writer = create_fastq_writer(&r1_path)?;
-    let mut r2_writer = create_fastq_writer(&r2_path)?;
-    let mut reader = parse_fastx_file(input_path)?;
-
-    let mut total_reads = 0usize;
-    let mut total_pairs = 0usize;
-    let window = insert;
-    let r2_offset = insert - len;
-
-    while let Some(record) = reader.next() {
-        let record = record?;
-        total_reads += 1;
-
-        let seq = record.seq();
-        let qual = record
-            .qual()
-            .ok_or_else(|| anyhow::anyhow!("FASTQ record is missing quality scores"))?;
-
-        if seq.len() < window || qual.len() < window {
-            continue;
-        }
-
-        let read_id = record
-            .id()
-            .split(|&b| b == b' ')
-            .next()
-            .unwrap_or(record.id());
-        let mut pair_idx = 0usize;
-
-        let mut start = 0usize;
-        while start + window <= seq.len() && start + window <= qual.len() {
-            let r1_seq = &seq[start..start + len];
-            let r1_qual = &qual[start..start + len];
-            let r2_src = &seq[start + r2_offset..start + r2_offset + len];
-            let r2_qual_src = &qual[start + r2_offset..start + r2_offset + len];
-            let r2_seq = barcode::reverse_complement(r2_src);
-            let mut r2_qual = r2_qual_src.to_vec();
-            r2_qual.reverse();
-
-            let pair_tag = format!("{}_{}", String::from_utf8_lossy(read_id), pair_idx);
-            write_fastq_record(&mut r1_writer, pair_tag.as_bytes(), r1_seq, r1_qual, b"/1")?;
-            write_fastq_record(
-                &mut r2_writer,
-                pair_tag.as_bytes(),
-                &r2_seq,
-                &r2_qual,
-                b"/2",
-            )?;
-
-            total_pairs += 1;
-            pair_idx += 1;
-            start += step;
-        }
-    }
-
+    let config = crate::pe::MakePeConfig::new(len, Some(insert), Some(step), false, 1)?;
+    let summary = crate::pe::make_pe(
+        input_path,
+        crate::pe::PeOutputTarget::Prefix(output_prefix),
+        &config,
+    )?;
     eprintln!(
         "make-PE: processed {} reads and wrote {} read pairs",
-        total_reads, total_pairs
+        summary.total_reads, summary.total_pairs
     );
     Ok(())
 }
@@ -411,55 +351,7 @@ pub fn split_fastq_by_barcodes(
     Ok(())
 }
 
-fn create_fastq_writer(path: &Path) -> Result<Box<dyn Write>> {
-    let file = File::create(path)?;
-    if path.to_string_lossy().ends_with(".gz") {
-        Ok(Box::new(GzEncoder::new(
-            BufWriter::new(file),
-            Compression::default(),
-        )))
-    } else {
-        Ok(Box::new(BufWriter::new(file)))
-    }
-}
-
-fn make_pe_output_paths(output_prefix: &Path) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
-    let prefix = output_prefix.to_string_lossy();
-    let (base, suffix) = if let Some(stripped) = prefix.strip_suffix(".fastq.gz") {
-        (stripped.to_string(), ".fastq.gz")
-    } else if let Some(stripped) = prefix.strip_suffix(".fq.gz") {
-        (stripped.to_string(), ".fastq.gz")
-    } else if let Some(stripped) = prefix.strip_suffix(".fastq") {
-        (stripped.to_string(), ".fastq")
-    } else if let Some(stripped) = prefix.strip_suffix(".fq") {
-        (stripped.to_string(), ".fastq")
-    } else {
-        (prefix.to_string(), ".fastq")
-    };
-
-    Ok((
-        std::path::PathBuf::from(format!("{}_R1{}", base, suffix)),
-        std::path::PathBuf::from(format!("{}_R2{}", base, suffix)),
-    ))
-}
-
-fn write_fastq_record(
-    writer: &mut Box<dyn Write>,
-    id: &[u8],
-    seq: &[u8],
-    qual: &[u8],
-    suffix: &[u8],
-) -> Result<()> {
-    writer.write_all(b"@")?;
-    writer.write_all(id)?;
-    writer.write_all(suffix)?;
-    writer.write_all(b"\n")?;
-    writer.write_all(seq)?;
-    writer.write_all(b"\n+\n")?;
-    writer.write_all(qual)?;
-    writer.write_all(b"\n")?;
-    Ok(())
-}
+use crate::pe::create_fastq_writer;
 
 pub fn discover_barcodes_fastq(
     input_path: &Path,

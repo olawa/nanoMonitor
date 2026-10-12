@@ -144,21 +144,47 @@ pub fn run_split(args: cli::SplitArgs) -> Result<()> {
 }
 
 pub fn run_make_pe(args: cli::MakePeArgs) -> Result<()> {
-    let input_str = args.input.to_string_lossy().to_lowercase();
-    if !is_fastq_path(&input_str) {
-        bail!("make-pe currently supports FASTQ/FASTQ.GZ input only");
-    }
-    let output_prefix = args
-        .output
-        .clone()
-        .unwrap_or_else(|| default_make_pe_prefix(&args.input, args.insert, args.step));
-    fastq::make_pe(
-        &args.input,
-        &output_prefix,
+    let config = nanofilter_core::pe::MakePeConfig::new(
         args.len,
         args.insert,
         args.step,
-    )
+        args.interleaved,
+        args.threads,
+    )?;
+
+    let default_prefix;
+    let default_interleaved_file;
+    let output_target = match args.output.as_deref() {
+        Some(p) if p.as_os_str() == "-" => nanofilter_core::pe::PeOutputTarget::Stdout,
+        Some(p) => {
+            if args.interleaved {
+                nanofilter_core::pe::PeOutputTarget::SingleFile(p)
+            } else {
+                nanofilter_core::pe::PeOutputTarget::Prefix(p)
+            }
+        }
+        None => {
+            default_prefix = nanofilter_core::pe::default_make_pe_prefix(
+                &args.input,
+                config.insert,
+                config.step,
+            );
+            if args.interleaved {
+                default_interleaved_file =
+                    nanofilter_core::pe::resolve_interleaved_path(&default_prefix);
+                nanofilter_core::pe::PeOutputTarget::SingleFile(&default_interleaved_file)
+            } else {
+                nanofilter_core::pe::PeOutputTarget::Prefix(&default_prefix)
+            }
+        }
+    };
+
+    let summary = nanofilter_core::pe::make_pe(&args.input, output_target, &config)?;
+    eprintln!(
+        "make-PE: processed {} reads, wrote {} read pairs (skipped {} reads < {} bp)",
+        summary.total_reads, summary.total_pairs, summary.skipped_short, config.insert
+    );
+    Ok(())
 }
 
 pub fn run_discover(args: cli::DiscoverArgs) -> Result<()> {
@@ -389,17 +415,7 @@ fn parse_len_args(args: &[String]) -> Result<(usize, usize)> {
     }
 }
 
-fn default_make_pe_prefix(input: &PathBuf, insert: usize, step: usize) -> PathBuf {
-    let path = input.as_path();
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new(""));
-    let stem = path.file_name().and_then(|n| n.to_str()).unwrap_or("reads");
-    let base = stem
-        .trim_end_matches(".fastq.gz")
-        .trim_end_matches(".fq.gz")
-        .trim_end_matches(".fastq")
-        .trim_end_matches(".fq");
-    parent.join(format!("{}_{}_{}", base, insert, step))
-}
+
 
 #[cfg(test)]
 mod tests {
@@ -438,6 +454,33 @@ mod tests {
         use chrono::TimeZone;
         assert_eq!(resolved.start, utc.with_ymd_and_hms(2026, 3, 17, 12, 10, 0).unwrap());
         assert_eq!(resolved.end, utc.with_ymd_and_hms(2026, 3, 17, 12, 25, 0).unwrap());
+    }
+
+    #[test]
+    fn test_cli_make_pe_e2e() {
+        let mut fq = NamedTempFile::new().unwrap();
+        let read_seq = "A".repeat(150) + &"C".repeat(150) + &"G".repeat(150) + &"T".repeat(150);
+        let read_qual = "I".repeat(600);
+        writeln!(fq, "@read_e2e\n{}\n+\n{}", read_seq, read_qual).unwrap();
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let prefix = out_dir.path().join("e2e_pe");
+
+        let args = cli::MakePeArgs {
+            input: fq.path().to_path_buf(),
+            output: Some(prefix.clone()),
+            len: 150,
+            insert: None,
+            step: None,
+            interleaved: false,
+            threads: 2,
+        };
+
+        run_make_pe(args).unwrap();
+
+        let (r1, r2) = nanofilter_core::pe::make_pe_output_paths(&prefix).unwrap();
+        assert!(r1.exists());
+        assert!(r2.exists());
     }
 }
 
