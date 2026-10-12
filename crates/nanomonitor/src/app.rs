@@ -463,6 +463,7 @@ impl NanoMonitorApp {
                 None,
                 false,
                 false,
+                0,
                 |intermediate| {
 
                     let new_data = build_dashboard_from_nanostream(intermediate);

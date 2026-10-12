@@ -79,6 +79,9 @@ enum Commands {
         split_by_amplicon: bool,
         #[arg(long, default_value_t = false)]
         split_chimeras: bool,
+        /// Maximum reads per amplicon to output, retaining the highest QV/quality reads (0 = no limit)
+        #[arg(long, default_value_t = 0)]
+        top_n: usize,
     },
 
     /// Calculate pore idle-time statistics
@@ -110,7 +113,7 @@ fn main() -> Result<()> {
         Commands::Enrichment { bam, bed, output, threads, cm_range } => {
             enrichment::run_enrichment(&bam, &bed, &output, threads, cm_range.as_deref())?;
         }
-        Commands::Amplicons { bam, primers, output, threads, mode, max_edit_dist, end_length, primer_tolerance, min_qs, len, max_reads, duplex_only, reference, gtf, summary, output_fastq, output_dimers, split_by_amplicon, split_chimeras } => {
+        Commands::Amplicons { bam, primers, output, threads, mode, max_edit_dist, end_length, primer_tolerance, min_qs, len, max_reads, duplex_only, reference, gtf, summary, output_fastq, output_dimers, split_by_amplicon, split_chimeras, top_n } => {
             let len_range = if len.is_empty() {
                 (0, usize::MAX)
             } else {
@@ -144,6 +147,7 @@ fn main() -> Result<()> {
                 output_dimers.as_deref(),
                 split_by_amplicon,
                 split_chimeras,
+                top_n,
             )?;
         }
 

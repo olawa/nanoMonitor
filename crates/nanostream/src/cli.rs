@@ -108,6 +108,9 @@ pub enum Commands {
         /// If set, detect internal primers and split chimeric concatemers into individual sub-reads
         #[arg(long, default_value_t = false)]
         split_chimeras: bool,
+        /// Maximum reads per amplicon to output, retaining the highest QV/quality reads (0 = no limit)
+        #[arg(long, default_value_t = 0)]
+        top_n: usize,
     },
 
     /// Calculate pore idle-time statistics

@@ -907,6 +907,116 @@ fn create_fastq_writer(path: &str) -> Result<Box<dyn std::io::Write>> {
     }
 }
 
+#[derive(Clone, Debug)]
+struct TopReadRecord {
+    quality: f32,
+    id: String,
+    seq: Vec<u8>,
+    qual: Vec<u8>,
+}
+
+impl PartialEq for TopReadRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.quality.to_bits() == other.quality.to_bits() && self.id == other.id
+    }
+}
+
+impl Eq for TopReadRecord {}
+
+impl Ord for TopReadRecord {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Min-heap ordering: smaller quality is Greater so that BinaryHeap::peek() yields the lowest quality read
+        other
+            .quality
+            .partial_cmp(&self.quality)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| other.id.cmp(&self.id))
+    }
+}
+
+impl PartialOrd for TopReadRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn add_to_top_reads(
+    top_reads: &mut HashMap<String, std::collections::BinaryHeap<TopReadRecord>>,
+    top_n: usize,
+    amplicon_name: &str,
+    quality: f32,
+    id: &str,
+    seq: &[u8],
+    qual: &[u8],
+) {
+    if top_n == 0 {
+        return;
+    }
+    let heap = top_reads.entry(amplicon_name.to_string()).or_default();
+    if heap.len() < top_n {
+        heap.push(TopReadRecord {
+            quality,
+            id: id.to_string(),
+            seq: seq.to_vec(),
+            qual: qual.to_vec(),
+        });
+    } else if let Some(worst) = heap.peek() {
+        if quality > worst.quality {
+            heap.pop();
+            heap.push(TopReadRecord {
+                quality,
+                id: id.to_string(),
+                seq: seq.to_vec(),
+                qual: qual.to_vec(),
+            });
+        }
+    }
+}
+
+fn flush_top_reads(
+    top_reads: &HashMap<String, std::collections::BinaryHeap<TopReadRecord>>,
+    output_fastq: Option<&str>,
+    split_by_amplicon: bool,
+    main_fq_writer: &mut Option<Box<dyn std::io::Write>>,
+    writers: &mut HashMap<String, Box<dyn std::io::Write>>,
+) -> Result<()> {
+    if let Some(ref out_path) = output_fastq {
+        let mut sorted_amplicons: Vec<(&String, &std::collections::BinaryHeap<TopReadRecord>)> =
+            top_reads.iter().collect();
+        sorted_amplicons.sort_by(|a, b| a.0.cmp(b.0));
+
+        for (name, heap) in sorted_amplicons {
+            let mut reads: Vec<&TopReadRecord> = heap.iter().collect();
+            reads.sort_by(|a, b| {
+                b.quality
+                    .partial_cmp(&a.quality)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+
+            for r in reads {
+                let writer = if split_by_amplicon {
+                    let path = get_split_path(out_path, name);
+                    writers.entry(name.clone()).or_insert_with(|| {
+                        create_fastq_writer(&path).expect("Failed to create split FASTQ writer")
+                    })
+                } else {
+                    main_fq_writer.as_mut().unwrap()
+                };
+
+                writer.write_all(b"@")?;
+                writer.write_all(r.id.as_bytes())?;
+                writer.write_all(b"\n")?;
+                writer.write_all(&r.seq)?;
+                writer.write_all(b"\n+\n")?;
+                writer.write_all(&r.qual)?;
+                writer.write_all(b"\n")?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn run_amplicons(
     bam_path: &str,
     primers_path: &str,
@@ -926,6 +1036,7 @@ pub fn run_amplicons(
     output_dimers: Option<&str>,
     split_by_amplicon: bool,
     split_chimeras: bool,
+    top_n: usize,
 ) -> Result<AmpliconResult> {
     run_amplicons_with_callback(
         bam_path,
@@ -946,6 +1057,7 @@ pub fn run_amplicons(
         output_dimers,
         split_by_amplicon,
         split_chimeras,
+        top_n,
         |_| {},
     )
 }
@@ -969,6 +1081,7 @@ pub fn run_amplicons_with_callback<F>(
     output_dimers: Option<&str>,
     split_by_amplicon: bool,
     split_chimeras: bool,
+    top_n: usize,
     mut progress_callback: F,
 ) -> Result<AmpliconResult>
 
@@ -1025,6 +1138,7 @@ where
         };
 
         let mut writers: HashMap<String, Box<dyn std::io::Write>> = HashMap::new();
+        let mut top_reads: HashMap<String, std::collections::BinaryHeap<TopReadRecord>> = HashMap::new();
 
         let chunk_size = 4096;
         let mut amplicons: HashMap<String, AmpliconStats> = HashMap::new();
@@ -1203,21 +1317,33 @@ where
                          stats.read_ids.push(r.id.clone());
 
                          if let Some(ref out_path) = output_fastq {
-                             let writer = if split_by_amplicon {
-                                 let path = get_split_path(out_path, name);
-                                 writers.entry(name.clone()).or_insert_with(|| {
-                                     create_fastq_writer(&path).expect("Failed to create split FASTQ writer")
-                                 })
+                             if top_n > 0 {
+                                 add_to_top_reads(
+                                     &mut top_reads,
+                                     top_n,
+                                     name,
+                                     res.quality,
+                                     &r.id,
+                                     &r.seq,
+                                     &r.qual,
+                                 );
                              } else {
-                                 main_fq_writer.as_mut().unwrap()
-                             };
-                             writer.write_all(b"@")?;
-                             writer.write_all(r.id.as_bytes())?;
-                             writer.write_all(b"\n")?;
-                             writer.write_all(&r.seq)?;
-                             writer.write_all(b"\n+\n")?;
-                             writer.write_all(&r.qual)?;
-                             writer.write_all(b"\n")?;
+                                 let writer = if split_by_amplicon {
+                                     let path = get_split_path(out_path, name);
+                                     writers.entry(name.clone()).or_insert_with(|| {
+                                         create_fastq_writer(&path).expect("Failed to create split FASTQ writer")
+                                     })
+                                 } else {
+                                     main_fq_writer.as_mut().unwrap()
+                                 };
+                                 writer.write_all(b"@")?;
+                                 writer.write_all(r.id.as_bytes())?;
+                                 writer.write_all(b"\n")?;
+                                 writer.write_all(&r.seq)?;
+                                 writer.write_all(b"\n+\n")?;
+                                 writer.write_all(&r.qual)?;
+                                 writer.write_all(b"\n")?;
+                             }
                          }
                     } else {
                          failed_pair_match += 1;
@@ -1261,6 +1387,23 @@ where
 
             if reached_eof || (max_reads > 0 && total_reads >= max_reads) {
                 break;
+            }
+        }
+
+        if top_n > 0 {
+            if output_fastq.is_some() {
+                flush_top_reads(
+                    &top_reads,
+                    output_fastq,
+                    split_by_amplicon,
+                    &mut main_fq_writer,
+                    &mut writers,
+                )?;
+            }
+            for (name, heap) in &top_reads {
+                if let Some(stats) = amplicons.get_mut(name) {
+                    stats.read_ids = heap.iter().map(|r| r.id.clone()).collect();
+                }
             }
         }
 
@@ -1381,6 +1524,18 @@ where
     let mut failed_pair_match = 0usize;
     let mut primer_matching_stats: HashMap<String, PrimerMatchingStats> = HashMap::new();
 
+    let mut main_fq_writer = if let Some(ref path) = output_fastq {
+        if !split_by_amplicon {
+            Some(create_fastq_writer(path)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let mut writers: HashMap<String, Box<dyn std::io::Write>> = HashMap::new();
+    let mut top_reads: HashMap<String, std::collections::BinaryHeap<TopReadRecord>> = HashMap::new();
+
     for result in bam.records() {
         let record = result?;
         total_raw_reads += 1;
@@ -1471,7 +1626,7 @@ where
                 stats.count += 1;
                 stats.lengths.push(res.length);
                 stats.qualities.push(res.quality);
-                stats.read_ids.push(read_id);
+                stats.read_ids.push(read_id.clone());
 
                 if let (Some(c), Some(s), Some(e)) = (&res.chrom, res.start, res.end) {
                     if stats.chrom.is_none() {
@@ -1482,6 +1637,43 @@ where
                         .or_insert_with(|| (c.clone(), Vec::new(), Vec::new()));
                     entry.1.push(s);
                     entry.2.push(e);
+                }
+
+                if let Some(ref out_path) = output_fastq {
+                    let seq_bytes = record.seq().as_bytes();
+                    let qual_bytes: Vec<u8> = if record.qual().is_empty() {
+                        vec![b'?'; seq_bytes.len()]
+                    } else {
+                        record.qual().iter().map(|&q| q + 33).collect()
+                    };
+
+                    if top_n > 0 {
+                        add_to_top_reads(
+                            &mut top_reads,
+                            top_n,
+                            name,
+                            res.quality,
+                            &read_id,
+                            &seq_bytes,
+                            &qual_bytes,
+                        );
+                    } else {
+                        let writer = if split_by_amplicon {
+                            let path = get_split_path(out_path, name);
+                            writers.entry(name.clone()).or_insert_with(|| {
+                                create_fastq_writer(&path).expect("Failed to create split FASTQ writer")
+                            })
+                        } else {
+                            main_fq_writer.as_mut().unwrap()
+                        };
+                        writer.write_all(b"@")?;
+                        writer.write_all(read_id.as_bytes())?;
+                        writer.write_all(b"\n")?;
+                        writer.write_all(&seq_bytes)?;
+                        writer.write_all(b"\n+\n")?;
+                        writer.write_all(&qual_bytes)?;
+                        writer.write_all(b"\n")?;
+                    }
                 }
             } else {
                 failed_pair_match += 1;
@@ -1601,6 +1793,23 @@ where
 
     if rescued_count > 0 {
         log::info!("Rescued {} reads using inferred coordinates", rescued_count);
+    }
+
+    if top_n > 0 {
+        if output_fastq.is_some() {
+            flush_top_reads(
+                &top_reads,
+                output_fastq,
+                split_by_amplicon,
+                &mut main_fq_writer,
+                &mut writers,
+            )?;
+        }
+        for (name, heap) in &top_reads {
+            if let Some(stats) = amplicons.get_mut(name) {
+                stats.read_ids = heap.iter().map(|r| r.id.clone()).collect();
+            }
+        }
     }
 
     // Finalize stats (compute medians, set coordinates)
@@ -1734,6 +1943,7 @@ pub fn run_amplicons_to_output(
     output_dimers: Option<&str>,
     split_by_amplicon: bool,
     split_chimeras: bool,
+    top_n: usize,
 ) -> Result<()> {
     let result = run_amplicons(
         bam_path,
@@ -1754,6 +1964,7 @@ pub fn run_amplicons_to_output(
         output_dimers,
         split_by_amplicon,
         split_chimeras,
+        top_n,
     )?;
     write_output(&result, output_path)?;
     Ok(())
@@ -1820,6 +2031,34 @@ mod tests {
         assert_eq!(split[0].id, "read_monomer");
         assert_eq!(split[0].seq, single.as_bytes());
     }
+
+    #[test]
+    fn test_top_n_selection() {
+        let mut top_reads: HashMap<String, std::collections::BinaryHeap<TopReadRecord>> = HashMap::new();
+        let top_n = 2;
+
+        add_to_top_reads(&mut top_reads, top_n, "AmpA", 12.0, "read_low", b"ACGT", b"IIII");
+        add_to_top_reads(&mut top_reads, top_n, "AmpA", 25.0, "read_high", b"ACGT", b"IIII");
+        add_to_top_reads(&mut top_reads, top_n, "AmpA", 15.0, "read_mid", b"ACGT", b"IIII");
+        add_to_top_reads(&mut top_reads, top_n, "AmpA", 30.0, "read_top", b"ACGT", b"IIII");
+
+        assert_eq!(top_reads.get("AmpA").unwrap().len(), 2);
+
+        let temp_path = std::env::temp_dir().join(format!("test_top_n_{}.fastq", std::process::id()));
+        let file = File::create(&temp_path).unwrap();
+        let mut main_writer: Option<Box<dyn std::io::Write>> = Some(Box::new(file));
+        let mut writers = HashMap::new();
+
+        flush_top_reads(&top_reads, Some("dummy.fastq"), false, &mut main_writer, &mut writers).unwrap();
+        drop(main_writer);
+
+        let written = std::fs::read_to_string(&temp_path).unwrap();
+        let _ = std::fs::remove_file(&temp_path);
+
+        // Top 2 qualities should be read_top (30.0) followed by read_high (25.0)
+        assert!(written.starts_with("@read_top\n"));
+        assert!(written.contains("@read_high\n"));
+        assert!(!written.contains("@read_low\n"));
+        assert!(!written.contains("@read_mid\n"));
+    }
 }
-
-

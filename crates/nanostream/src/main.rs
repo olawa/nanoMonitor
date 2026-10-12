@@ -46,6 +46,7 @@ fn main() -> Result<()> {
             output_dimers,
             split_by_amplicon,
             split_chimeras,
+            top_n,
         } => {
             let len_range = if len.is_empty() {
                 (0, usize::MAX)
@@ -80,6 +81,7 @@ fn main() -> Result<()> {
                 output_dimers.as_deref(),
                 split_by_amplicon,
                 split_chimeras,
+                top_n,
             )?;
         }
 
