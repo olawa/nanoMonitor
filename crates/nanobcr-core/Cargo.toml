@@ -1,0 +1,18 @@
+[package]
+name = "nanobcr-core"
+version = "0.1.0"
+edition = "2021"
+description = "Live BCR-ABL1 engine: watch MinKNOW FASTQ, filter, splice-align, and keep per-barcode BAMs for analysis and nagini"
+
+[dependencies]
+anyhow = "1"
+log = "0.4"
+needletail = "0.5.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+nanofilter-core = { path = "../nanofilter-core" }
+nanoseq-core = { path = "../nanoseq-core" }
+
+[dev-dependencies]
+tempfile = "3"
+flate2 = "1"

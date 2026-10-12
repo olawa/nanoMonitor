@@ -7,5 +7,6 @@ members = [
     "crates/nanofilter-core",
     "crates/nanofilter",
     "crates/nanostream",
+    "crates/nanobcr-core",
 ]
 resolver = "2"

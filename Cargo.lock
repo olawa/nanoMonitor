@@ -2155,6 +2155,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanobcr-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "log",
+ "nanofilter-core",
+ "nanoseq-core",
+ "needletail",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "nanofilter"
 version = "0.1.0"
 dependencies = [
