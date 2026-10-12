@@ -65,8 +65,10 @@ python nanoMonitor.py --dir /path/to/output_fastq_dir/ --threads 12
 
 1.  **Start the Server** (on the analysis machine):
     ```bash
-    python ns_server.py --rep-port 5555 --pub-port 5556 --secret my_secure_token
+    python ns_server.py --rep-port 5555 --pub-port 5556 --secret my_secure_token --bind 0.0.0.0
     ```
+    The server listens on loopback only unless `--bind` is given, and refuses a non-loopback
+    `--bind` without `--secret`. Only connect to servers you trust: replies are Python pickles.
 
 2.  **Start the Monitor** (on your local machine):
     ```bash

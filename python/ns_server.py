@@ -6,15 +6,51 @@ import sys
 import os
 import zmq
 import pickle
+import io
+import hmac
+import ipaddress
 import time
 import argparse
 import glob
 from PyQt6.QtCore import QCoreApplication, QObject, pyqtSlot, QTimer, QThread
 from ns_workers import AnalysisWorker
 
+class _CommandUnpickler(pickle.Unpickler):
+    """Unpickler for client commands, which are plain dicts of str/int/float/bool/list.
+
+    Those need no global lookups, so refusing every one removes the code execution
+    that a bare pickle.loads on network input allows (the command is read before
+    the auth token can be checked, so it must be safe to parse unauthenticated).
+    """
+
+    def find_class(self, module, name):
+        raise pickle.UnpicklingError(f"global {module}.{name} is not allowed in commands")
+
+
+def load_command(msg_bytes):
+    cmd = _CommandUnpickler(io.BytesIO(msg_bytes)).load()
+    if not isinstance(cmd, dict):
+        raise pickle.UnpicklingError("command must be a dict")
+    return cmd
+
+
+def is_loopback(host):
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 class NanoServer(QObject):
-    def __init__(self, rep_port=5555, pub_port=5556, secret=None):
+    def __init__(self, rep_port=5555, pub_port=5556, secret=None, bind="127.0.0.1"):
         super().__init__()
+        if not secret and not is_loopback(bind):
+            raise SystemExit(
+                f"Refusing to listen on {bind} without --secret: the server can list "
+                "directories and run analyses for whoever connects."
+            )
         self.rep_port = rep_port
         self.pub_port = pub_port
         self.secret = secret
@@ -22,13 +58,13 @@ class NanoServer(QObject):
         # ZeroMQ Setup
         self.context = zmq.Context()
         self.rep_socket = self.context.socket(zmq.REP)
-        self.rep_socket.bind(f"tcp://*:{self.rep_port}")
+        self.rep_socket.bind(f"tcp://{bind}:{self.rep_port}")
         
         self.pub_socket = self.context.socket(zmq.PUB)
-        self.pub_socket.bind(f"tcp://*:{self.pub_port}")
+        self.pub_socket.bind(f"tcp://{bind}:{self.pub_port}")
         
-        print(f"[Server] Listening for commands on port {self.rep_port}")
-        print(f"[Server] Publishing updates on port {self.pub_port}")
+        print(f"[Server] Listening for commands on {bind}:{self.rep_port}")
+        print(f"[Server] Publishing updates on {bind}:{self.pub_port}")
 
         self.worker = None
 
@@ -48,13 +84,15 @@ class NanoServer(QObject):
 
     def handle_command(self, msg_bytes):
         try:
-            cmd_data = pickle.loads(msg_bytes)
+            cmd_data = load_command(msg_bytes)
             
             # Auth Check
             if self.secret:
                 token = cmd_data.get('auth_token')
-                if token != self.secret:
-                    print(f"[Server] Auth Failed. Token: {token}")
+                if not isinstance(token, str) or not hmac.compare_digest(
+                    token.encode(), self.secret.encode()
+                ):
+                    print("[Server] Auth failed")
                     self.rep_socket.send(pickle.dumps("AUTH_ERROR"))
                     return
 
@@ -278,13 +316,16 @@ def main():
     parser.add_argument("--rep-port", type=int, default=5555, help="Port for REP socket (commands)")
     parser.add_argument("--pub-port", type=int, default=5556, help="Port for PUB socket (updates)")
     parser.add_argument("--secret", type=str, default=None, help="Authentication Secret")
+    parser.add_argument("--bind", type=str, default="127.0.0.1",
+                        help="Address to listen on (default: loopback only; a non-loopback "
+                             "address requires --secret)")
     
     args = parser.parse_args()
     
     # Create QApp (required for QThread)
     app = QCoreApplication(sys.argv)
     
-    server = NanoServer(rep_port=args.rep_port, pub_port=args.pub_port, secret=args.secret)
+    server = NanoServer(rep_port=args.rep_port, pub_port=args.pub_port, secret=args.secret, bind=args.bind)
     
     print("[Server] Ready. Press Ctrl+C to exit.")
     
