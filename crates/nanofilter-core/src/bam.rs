@@ -3,7 +3,7 @@ use chrono::{DateTime, FixedOffset};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use nanoseq_core::filters::{PoreRange, TimeWindow};
 use nanoseq_core::header::NanoporeMetadata;
-use nanoseq_core::quality::{mean_qv_from_phred_scores, phred_to_fastq_ascii, select_qv};
+use nanoseq_core::quality::{mean_qv_from_phred_scores, phred_to_fastq_ascii, select_basecaller_qv};
 use noodles::bam;
 use noodles::bgzf;
 use noodles::sam;
@@ -17,6 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::barcode;
+use crate::summary::{ReadSelection, SelectionStats, Verdict};
 
 #[derive(Debug, Clone)]
 pub struct FilterSettings {
@@ -493,23 +494,140 @@ pub fn filter_bam_with_settings_threads(
     settings: &FilterSettings,
     threads: usize,
 ) -> Result<()> {
+    filter_bam_selected(input_path, output_path, settings, threads, None, false)
+}
+
+/// Tags an aligner adds. An unaligned copy of an aligned read must not carry
+/// them into a new alignment: minimap2 -y copies every tag of its input, so
+/// a stale SA or NM would sit beside the new alignment's own.
+const ALIGNMENT_TAGS: [[u8; 2]; 27] = [
+    *b"AS", *b"MD", *b"NM", *b"SA", *b"XA", *b"XS", *b"XM", *b"XO", *b"XG", *b"MC", *b"MQ",
+    *b"HI", *b"IH", *b"H0", *b"H1", *b"H2", *b"CC", *b"CP", *b"CG",
+    // minimap2
+    *b"ms", *b"nn", *b"tp", *b"cm", *b"s1", *b"s2", *b"de", *b"rl",
+];
+
+fn is_secondary_or_supplementary(record: &bam::Record) -> bool {
+    let flags = record.flags();
+    flags.is_secondary() || flags.is_supplementary()
+}
+
+fn reverse_complement(bases: &[u8]) -> Vec<u8> {
+    bases
+        .iter()
+        .rev()
+        .map(|&b| match b {
+            b'A' => b'T', b'T' => b'A', b'C' => b'G', b'G' => b'C',
+            b'a' => b't', b't' => b'a', b'c' => b'g', b'g' => b'c',
+            b'R' => b'Y', b'Y' => b'R', b'K' => b'M', b'M' => b'K',
+            b'B' => b'V', b'V' => b'B', b'D' => b'H', b'H' => b'D',
+            other => other,
+        })
+        .collect()
+}
+
+/// The read as it came off the sequencer: unmapped, in its original
+/// orientation, without alignment fields or aligner tags. Read-level tags --
+/// qs, ch, st, MM/ML (which refer to the original orientation), RG -- stay.
+pub fn unaligned_copy(header: &sam::Header, record: &bam::Record) -> Result<sam::alignment::RecordBuf> {
+    use sam::alignment::record::Flags;
+    use sam::alignment::record_buf::data::field::Value as BufValue;
+
+    let mut buf = sam::alignment::RecordBuf::try_from_alignment_record(header, record)?;
+    let reverse = buf.flags().is_reverse_complemented();
+    let mut flags = Flags::UNMAPPED;
+    if buf.flags().is_qc_fail() {
+        flags |= Flags::QC_FAIL;
+    }
+    *buf.flags_mut() = flags;
+    *buf.reference_sequence_id_mut() = None;
+    *buf.alignment_start_mut() = None;
+    *buf.mapping_quality_mut() = None;
+    *buf.cigar_mut() = Default::default();
+    *buf.mate_reference_sequence_id_mut() = None;
+    *buf.mate_alignment_start_mut() = None;
+    *buf.template_length_mut() = 0;
+    if reverse {
+        let bases = reverse_complement(buf.sequence().as_ref());
+        *buf.sequence_mut() = bases.into();
+        let mut scores = buf.quality_scores().as_ref().to_vec();
+        scores.reverse();
+        *buf.quality_scores_mut() = scores.into();
+    }
+    for tag in ALIGNMENT_TAGS {
+        buf.data_mut().remove(&sam::alignment::record::data::field::Tag::new(tag[0], tag[1]));
+    }
+    // minimap2's ts is the transcript strand, a character; dorado's ts is the
+    // number of trimmed samples, an integer, and stays.
+    let ts = sam::alignment::record::data::field::Tag::new(b't', b's');
+    if matches!(buf.data().get(&ts), Some(BufValue::Character(_))) {
+        buf.data_mut().remove(&ts);
+    }
+    Ok(buf)
+}
+
+/// The input header without its reference sequences and with an unknown sort
+/// order, for a BAM of unaligned reads. Read groups and programs stay.
+fn unaligned_header(header: &sam::Header) -> Result<sam::Header> {
+    let mut header = header.clone();
+    header.reference_sequences_mut().clear();
+    *header.header_mut() = Some(
+        "@HD\tVN:1.6\tSO:unknown\n"
+            .parse::<sam::Header>()
+            .map_err(|e| anyhow::anyhow!("Failed to build @HD: {e}"))?
+            .header()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Failed to build @HD"))?,
+    );
+    Ok(header)
+}
+
+/// Filter a BAM.
+///
+/// `selection` first keeps the reads a sequencing summary selects and judges
+/// their quality by its mean_qscore_template. `unaligned` writes each kept
+/// read once, as an unaligned record (see [`unaligned_copy`]): secondary and
+/// supplementary records are skipped, so an aligned BAM -- MinKNOW's bam_pass
+/// -- comes out ready to be aligned again.
+///
+/// A selection picks reads, not records, so with one an aligned BAM keeps its
+/// primary alignments only: a secondary or supplementary record would be
+/// judged on its own clipped length and, lacking qualities of its own, on the
+/// read's summary quality -- and a hard-clipped record without qualities is
+/// not even writable.
+pub fn filter_bam_selected(
+    input_path: &Path,
+    output_path: &Path,
+    settings: &FilterSettings,
+    threads: usize,
+    selection: Option<&ReadSelection>,
+    unaligned: bool,
+) -> Result<()> {
     let worker_count = std::num::NonZeroUsize::new(std::cmp::max(1, threads)).unwrap();
     let mut reader = bam::io::Reader::from(bgzf::MultithreadedReader::with_worker_count(
         worker_count,
         File::open(input_path)?,
     ));
     let header = reader.read_header()?;
+    let output_header = if unaligned { unaligned_header(&header)? } else { header.clone() };
     let mut writer = bam::io::Writer::from(bgzf::MultithreadedWriter::with_worker_count(
         worker_count,
         File::create(output_path)?,
     ));
-    writer.write_header(&header)?;
+    writer.write_header(&output_header)?;
 
     let mut kept = 0;
     let mut total = 0;
+    let mut selection_stats = SelectionStats::default();
     let mut record = bam::Record::default();
     while reader.read_record(&mut record)? != 0 {
+        if (unaligned || selection.is_some()) && is_secondary_or_supplementary(&record) {
+            continue;
+        }
         total += 1;
+        let Some(summary_qv) = select_record(selection, &mut selection_stats, &record) else {
+            continue;
+        };
         let seq_len = record.sequence().len();
         if seq_len < settings.min_len || seq_len > settings.max_len {
             continue;
@@ -520,14 +638,44 @@ pub fn filter_bam_with_settings_threads(
         if !matches_time_window_from_record(&record, settings.time_window.as_ref()) {
             continue;
         }
-        let avg_qv = get_quality_score_lowlevel(&record)?;
+        let avg_qv = match summary_qv {
+            Some(qv) => qv,
+            None => get_quality_score_lowlevel(&record)?,
+        };
         if avg_qv >= settings.qv_threshold {
-            writer.write_record(&header, &record)?;
+            if unaligned {
+                let buf = unaligned_copy(&header, &record)?;
+                sam::alignment::io::Write::write_alignment_record(&mut writer, &output_header, &buf)?;
+            } else {
+                writer.write_record(&header, &record)?;
+            }
             kept += 1;
         }
     }
     eprintln!("BAM: Kept {} / {} reads", kept, total);
+    if selection.is_some() {
+        eprintln!("BAM: {}", selection_stats.report());
+    }
     Ok(())
+}
+
+/// `None` drops the record; `Some(qv)` keeps it, with the summary's quality
+/// when the summary has one.
+fn select_record(
+    selection: Option<&ReadSelection>,
+    stats: &mut SelectionStats,
+    record: &bam::Record,
+) -> Option<Option<f64>> {
+    let Some(selection) = selection else {
+        return Some(None);
+    };
+    let name = record.name().map(|n| String::from_utf8_lossy(n.as_ref()).into_owned())?;
+    let verdict = selection.judge(&name);
+    stats.record(verdict);
+    match verdict {
+        Verdict::Keep { mean_qscore } => Some(mean_qscore),
+        _ => None,
+    }
 }
 
 pub fn bam_to_fastq(
@@ -561,9 +709,24 @@ pub fn bam_to_fastq_with_settings_threads(
     settings: &FilterSettings,
     threads: usize,
 ) -> Result<()> {
+    bam_to_fastq_selected(input_path, output_path, settings, threads, None)
+}
+
+/// BAM to FASTQ with the same filters. One record per read, as sequenced:
+/// secondary and supplementary alignments are skipped and a reverse-strand
+/// alignment is turned back, so an aligned BAM gives the reads it was made
+/// from rather than duplicates and reverse complements.
+pub fn bam_to_fastq_selected(
+    input_path: &Path,
+    output_path: &Path,
+    settings: &FilterSettings,
+    threads: usize,
+    selection: Option<&ReadSelection>,
+) -> Result<()> {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::io::BufWriter;
+    use std::io::Write as _;
 
     let worker_count = std::num::NonZeroUsize::new(std::cmp::max(1, threads)).unwrap();
     let mut reader = bam::io::Reader::from(bgzf::MultithreadedReader::with_worker_count(
@@ -584,9 +747,16 @@ pub fn bam_to_fastq_with_settings_threads(
 
     let mut kept = 0;
     let mut total = 0;
+    let mut selection_stats = SelectionStats::default();
     let mut record = bam::Record::default();
     while reader.read_record(&mut record)? != 0 {
+        if is_secondary_or_supplementary(&record) {
+            continue;
+        }
         total += 1;
+        let Some(summary_qv) = select_record(selection, &mut selection_stats, &record) else {
+            continue;
+        };
         let seq_len = record.sequence().len();
         if seq_len < settings.min_len || seq_len > settings.max_len {
             continue;
@@ -597,9 +767,17 @@ pub fn bam_to_fastq_with_settings_threads(
         if !matches_time_window_from_record(&record, settings.time_window.as_ref()) {
             continue;
         }
-        let avg_qv = get_quality_score_lowlevel(&record)?;
+        let avg_qv = match summary_qv {
+            Some(qv) => qv,
+            None => get_quality_score_lowlevel(&record)?,
+        };
         if avg_qv >= settings.qv_threshold {
-            use std::io::Write as _;
+            let mut bases: Vec<u8> = record.sequence().iter().collect();
+            let mut quals: Vec<u8> = record.quality_scores().iter().collect();
+            if record.flags().is_reverse_complemented() {
+                bases = reverse_complement(&bases);
+                quals.reverse();
+            }
             writer.write_all(b"@")?;
             writer.write_all(
                 record
@@ -607,20 +785,19 @@ pub fn bam_to_fastq_with_settings_threads(
                     .ok_or_else(|| anyhow::anyhow!("Missing read name"))?,
             )?;
             writer.write_all(b"\n")?;
-            let seq = record.sequence();
-            for b in seq.iter() {
-                writer.write_all(&[b])?;
-            }
+            writer.write_all(&bases)?;
             writer.write_all(b"\n+\n")?;
-            let qual = record.quality_scores();
-            for b in qual.iter() {
-                writer.write_all(&[phred_to_fastq_ascii(b)])?;
+            for q in quals {
+                writer.write_all(&[phred_to_fastq_ascii(q)])?;
             }
             writer.write_all(b"\n")?;
             kept += 1;
         }
     }
     eprintln!("BAM->FASTQ: Kept {} / {} reads", kept, total);
+    if selection.is_some() {
+        eprintln!("BAM->FASTQ: {}", selection_stats.report());
+    }
     Ok(())
 }
 
@@ -713,8 +890,17 @@ pub fn get_quality_score_lowlevel(record: &bam::Record) -> Result<f64> {
         return Ok(explicit_qs.unwrap_or(0.0));
     }
 
-    let phred_scores: Vec<u8> = qual.iter().collect();
-    Ok(select_qv(explicit_qs, &phred_scores))
+    // Without a qs, recompute it as dorado does, from base 60 of the read as
+    // sequenced: a reverse-strand alignment stores the qualities reversed.
+    let mut phred_scores: Vec<u8> = qual.iter().collect();
+    if record.flags().is_reverse_complemented() {
+        phred_scores.reverse();
+    }
+    let split_read = record
+        .data()
+        .get(&sam::alignment::record::data::field::Tag::new(b'p', b'i'))
+        .is_some();
+    Ok(select_basecaller_qv(explicit_qs, &phred_scores, split_read))
 }
 
 pub fn create_unaligned_header(

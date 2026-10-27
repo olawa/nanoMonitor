@@ -62,14 +62,61 @@ pub fn run_filter(args: cli::FilterArgs) -> Result<()> {
         time_window,
     };
 
+    let selection = match &args.sequencing_summary {
+        Some(path) => {
+            let summary =
+                nanofilter_core::summary::SequencingSummary::load(path, args.barcode.as_deref())?;
+            eprintln!(
+                "Sequencing summary: {} reads{}",
+                summary.len(),
+                args.barcode
+                    .as_deref()
+                    .map(|b| format!(" assigned to {b}"))
+                    .unwrap_or_default()
+            );
+            Some(nanofilter_core::summary::ReadSelection {
+                summary,
+                both_ends_min_score: args.both_ends.then_some(args.min_barcode_score),
+                barcode: args.barcode.clone(),
+            })
+        }
+        None => None,
+    };
+
     let output_bam = output_is_bam(&args.output, &args.output_format)?;
-    run_filter_or_extract(
+    run_selected_filter(
         &args.input,
         &args.output,
         &settings,
         output_bam,
         args.threads,
+        selection.as_ref(),
+        args.unaligned,
     )
+}
+
+fn run_selected_filter(
+    input: &PathBuf,
+    output: &PathBuf,
+    settings: &bam::FilterSettings,
+    output_bam: bool,
+    threads: usize,
+    selection: Option<&nanofilter_core::summary::ReadSelection>,
+    unaligned: bool,
+) -> Result<()> {
+    let input_str = input.to_string_lossy().to_lowercase();
+    if input_str.ends_with(".bam") {
+        if output_bam {
+            bam::filter_bam_selected(input, output, settings, threads, selection, unaligned)?;
+        } else {
+            bam::bam_to_fastq_selected(input, output, settings, threads, selection)?;
+        }
+    } else if is_fastq_path(&input_str) {
+        fastq::filter_fastq_selected(input, output, settings, output_bam, selection)?;
+    } else {
+        bail!("Unsupported input format");
+    }
+    Ok(())
 }
 
 pub fn run_extract(args: cli::ExtractArgs) -> Result<()> {
@@ -602,6 +649,10 @@ mod tests {
             time_end: Some("-5m".to_string()),
             threads: 4,
             sequencing_summary: Some(summary_file.path().to_path_buf()),
+            both_ends: false,
+            min_barcode_score: 60.0,
+            barcode: None,
+            unaligned: false,
         };
 
         // Resolve time window using our summary scanning

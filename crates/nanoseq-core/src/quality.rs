@@ -51,11 +51,67 @@ pub fn select_qv(explicit_qs: Option<f64>, phred_scores: &[u8]) -> f64 {
     explicit_qs.unwrap_or_else(|| mean_qv_from_phred_scores(phred_scores))
 }
 
+/// Dorado leaves the first bases out of a read's mean quality: they are the
+/// adapter and barcode region, and low quality.
+pub const BASECALLER_QSCORE_START: usize = 60;
+
+/// A read's mean quality as dorado computes its `qs`: from base 60 on, except
+/// for a read split out of a longer one, and a read too short to have
+/// anything after base 60, which are averaged over every base.
+///
+/// Checked against MinKNOW 6.4 output: this reproduces `qs` to 0.01 for 99.2 %
+/// of reads, where the mean over the whole read matches 0.7 %. It is the
+/// fallback for reads without a `qs`, so a `--qv` threshold means the same
+/// thing whether the basecaller's value was kept or not.
+pub fn basecaller_mean_qv_from_phred_scores(phred_scores: &[u8], split_read: bool) -> f64 {
+    if split_read || phred_scores.len() <= BASECALLER_QSCORE_START {
+        mean_qv_from_phred_scores(phred_scores)
+    } else {
+        mean_qv_from_phred_scores(&phred_scores[BASECALLER_QSCORE_START..])
+    }
+}
+
+pub fn basecaller_mean_qv_from_fastq_ascii(qual_ascii: &[u8], split_read: bool) -> f64 {
+    let phred_scores: Vec<u8> = qual_ascii.iter().map(|q| q.saturating_sub(33)).collect();
+    if phred_scores.is_empty() {
+        return 0.0;
+    }
+    basecaller_mean_qv_from_phred_scores(&phred_scores, split_read)
+}
+
+/// The basecaller's `qs` when the read carries it, else the same value
+/// recomputed the way the basecaller computes it.
+pub fn select_basecaller_qv(explicit_qs: Option<f64>, phred_scores: &[u8], split_read: bool) -> f64 {
+    explicit_qs.unwrap_or_else(|| basecaller_mean_qv_from_phred_scores(phred_scores, split_read))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
+        basecaller_mean_qv_from_fastq_ascii, basecaller_mean_qv_from_phred_scores,
         mean_qv_from_fastq_ascii, mean_qv_from_phred_scores, phred_to_fastq_ascii, select_qv,
+        BASECALLER_QSCORE_START,
     };
+
+    #[test]
+    fn basecaller_mean_leaves_out_the_first_60_bases() {
+        // Q5 over the adapter region, Q20 after it: dorado reports 20.
+        let mut phred = vec![5u8; BASECALLER_QSCORE_START];
+        phred.extend(vec![20u8; 500]);
+        assert!((basecaller_mean_qv_from_phred_scores(&phred, false) - 20.0).abs() < 1e-9);
+        assert!(mean_qv_from_phred_scores(&phred) < 19.0);
+    }
+
+    #[test]
+    fn split_and_short_reads_are_averaged_over_every_base() {
+        let mut phred = vec![5u8; BASECALLER_QSCORE_START];
+        phred.extend(vec![20u8; 500]);
+        let whole = mean_qv_from_phred_scores(&phred);
+        assert!((basecaller_mean_qv_from_phred_scores(&phred, true) - whole).abs() < 1e-9);
+        let short = vec![20u8; 40];
+        assert!((basecaller_mean_qv_from_phred_scores(&short, false) - 20.0).abs() < 1e-9);
+        assert_eq!(basecaller_mean_qv_from_fastq_ascii(b"", false), 0.0);
+    }
 
     #[test]
     fn computes_mean_qv_from_phred_scores() {

@@ -177,9 +177,29 @@ pub struct FilterArgs {
     /// Number of threads for threaded BAM IO and parallel FASTQ operations where supported
     #[arg(short, long, default_value_t = 8)]
     pub threads: usize,
-    /// Path to ONT sequencing summary file for relative time-filtering baseline discovery
+    /// ONT sequencing summary. Reads it lists are judged by its
+    /// mean_qscore_template (MinKNOW's own qs, also for FASTQ, whose headers
+    /// carry none); it also gives the baseline for relative time windows.
+    /// It selects reads, so an aligned BAM keeps its primary alignments only.
     #[arg(long)]
     pub sequencing_summary: Option<PathBuf>,
+    /// Keep only reads with their barcode at both ends: the front and rear
+    /// score of the assigned barcode in the sequencing summary both at least
+    /// --min-barcode-score. Needs --sequencing-summary; no demultiplexing again.
+    #[arg(long, requires = "sequencing_summary")]
+    pub both_ends: bool,
+    /// Minimum front and rear barcode score for --both-ends.
+    #[arg(long, default_value_t = 60.0)]
+    pub min_barcode_score: f64,
+    /// Keep only reads the sequencing summary assigns to this barcode
+    /// (barcode05, bc5 and NB05 are the same). Needs --sequencing-summary.
+    #[arg(long, requires = "sequencing_summary")]
+    pub barcode: Option<String>,
+    /// For BAM output: write each kept read once, unaligned, in its original
+    /// orientation and without aligner tags, so an aligned BAM (MinKNOW's
+    /// bam_pass) can be aligned again. FASTQ output always is.
+    #[arg(long)]
+    pub unaligned: bool,
 }
 
 #[derive(Parser, Clone)]

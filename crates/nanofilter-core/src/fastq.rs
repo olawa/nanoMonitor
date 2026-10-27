@@ -15,6 +15,7 @@ use std::sync::Arc;
 use crate::bam::{FilterSettings, UnalignedBamWriter};
 use crate::barcode;
 use crate::filter::read_mean_qv;
+use crate::summary::{ReadSelection, SelectionStats, Verdict};
 
 struct OwnedRecord {
     id: Vec<u8>,
@@ -46,10 +47,47 @@ pub fn filter_fastq_with_settings(
     settings: &FilterSettings,
     output_bam: bool,
 ) -> Result<()> {
+    filter_fastq_selected(input_path, output_path, settings, output_bam, None)
+}
+
+/// Apply `selection` to a read's metadata: `None` drops the read, otherwise
+/// the metadata to judge it by, with the summary's quality when it has one.
+fn select_read(
+    selection: Option<&ReadSelection>,
+    stats: &mut SelectionStats,
+    mut metadata: NanoporeMetadata,
+) -> Option<NanoporeMetadata> {
+    let Some(selection) = selection else {
+        return Some(metadata);
+    };
+    let verdict = selection.judge(&metadata.read_id);
+    stats.record(verdict);
+    match verdict {
+        Verdict::Keep { mean_qscore } => {
+            if mean_qscore.is_some() {
+                metadata.mean_qscore = mean_qscore;
+            }
+            Some(metadata)
+        }
+        _ => None,
+    }
+}
+
+/// Filter a FASTQ, optionally selecting reads from a sequencing summary first
+/// (both-ends barcoding, assigned barcode) and judging their quality by the
+/// summary's mean_qscore_template.
+pub fn filter_fastq_selected(
+    input_path: &Path,
+    output_path: &Path,
+    settings: &FilterSettings,
+    output_bam: bool,
+    selection: Option<&ReadSelection>,
+) -> Result<()> {
     let mut reader = parse_fastx_file(input_path)?;
 
     let mut kept = 0;
     let mut total = 0;
+    let mut selection_stats = SelectionStats::default();
 
     if output_bam {
         let mut bam_writer: Option<UnalignedBamWriter> = None;
@@ -63,6 +101,9 @@ pub fn filter_fastq_with_settings(
             if bam_writer.is_none() {
                 bam_writer = Some(UnalignedBamWriter::new(output_path, &metadata, settings)?);
             }
+            let Some(metadata) = select_read(selection, &mut selection_stats, metadata) else {
+                continue;
+            };
 
             let qual = record
                 .qual()
@@ -94,7 +135,11 @@ pub fn filter_fastq_with_settings(
             total += 1;
             let seq = record.seq();
             let len = seq.len();
-            let metadata = parse_nanopore_header(record.id());
+            let Some(metadata) =
+                select_read(selection, &mut selection_stats, parse_nanopore_header(record.id()))
+            else {
+                continue;
+            };
             let qual = record
                 .qual()
                 .ok_or_else(|| anyhow::anyhow!("No quality scores"))?;
@@ -104,6 +149,9 @@ pub fn filter_fastq_with_settings(
             }
         }
         eprintln!("FASTQ: Kept {} / {} reads", kept, total);
+    }
+    if selection.is_some() {
+        eprintln!("FASTQ: {}", selection_stats.report());
     }
     Ok(())
 }

@@ -14,9 +14,21 @@ pub struct NanoporeMetadata {
     /// over recomputing from the quality string: it is what dorado reports and
     /// what a `--qv` threshold is normally understood to mean.
     pub mean_qscore: Option<f64>,
+    /// The read this one was split from (`parent_read_id=` / `pi:Z:`). Equal to
+    /// `read_id`, or absent, for a read that was not split.
+    pub parent_read_id: Option<String>,
 }
 
 impl NanoporeMetadata {
+    /// Whether dorado split this read out of a longer one. Dorado computes the
+    /// mean quality of a split read over all of it, not from base 60.
+    pub fn is_split_read(&self) -> bool {
+        self.parent_read_id
+            .as_deref()
+            .map(|parent| !parent.is_empty() && parent != self.read_id)
+            .unwrap_or(false)
+    }
+
     pub fn read_group_id(&self) -> String {
         match (&self.run_id, &self.barcode) {
             (Some(run), Some(bc)) => format!("{}_{}", run, bc),
@@ -105,6 +117,7 @@ pub fn parse_nanopore_header(header: &[u8]) -> NanoporeMetadata {
         channel: tags.get("ch").and_then(|s| s.parse::<i64>().ok()),
         start_time: first(&["start_time", "st"]),
         mean_qscore: tags.get("qs").and_then(|s| s.parse::<f64>().ok()),
+        parent_read_id: first(&["parent_read_id", "pi"]),
     }
 }
 
@@ -177,6 +190,17 @@ mod tests {
         assert_eq!(meta.channel, Some(12));
         // The timestamp's own colons must not be mistaken for a SAM tag.
         assert_eq!(meta.start_time.as_deref(), Some("2026-03-17T12:00:00Z"));
+    }
+
+    #[test]
+    fn recognises_a_split_read_in_either_header_dialect() {
+        let minknow = parse_nanopore_header(b"@child runid=r parent_read_id=parent barcode=barcode01");
+        assert!(minknow.is_split_read());
+        let dorado = parse_nanopore_header(b"@child qs:f:18.0 pi:Z:parent");
+        assert!(dorado.is_split_read());
+        let unsplit = parse_nanopore_header(b"@read1 runid=r parent_read_id=read1");
+        assert!(!unsplit.is_split_read());
+        assert!(!parse_nanopore_header(b"@read1 qs:f:18.0").is_split_read());
     }
 
     #[test]
